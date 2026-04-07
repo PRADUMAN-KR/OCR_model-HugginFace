@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  ocr-api:
+    build: .
+    container_name: ocr-benchmark-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app/app        # hot-reload in dev
+      - paddle_cache:/root/.paddleocr
+      - easyocr_cache:/root/.EasyOCR
+    restart: unless-stopped
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  paddle_cache:
+  easyocr_cache:

@@ -1,0 +1,185 @@
+"""
+PaddleOCR PP-OCRv4 — Tier 2
+Supports: English, Arabic, Hindi, Punjabi (via lang codes)
+Install: pip install paddlepaddle paddleocr
+"""
+
+import logging
+from io import BytesIO
+from PIL import Image
+import numpy as np
+
+from app.models.base import BaseOCRModel, OCRResult, OCRWord, SupportedLanguage
+from app.core.document import load_document_as_rgb_images
+
+logger = logging.getLogger(__name__)
+
+# PaddleOCR language configuration for this installed paddleocr version
+LANG_CONFIG = {
+    SupportedLanguage.ENGLISH: {"lang": "en", "ocr_version": "PP-OCRv4"},
+    SupportedLanguage.ARABIC: {"lang": "ar", "ocr_version": "PP-OCRv5"},
+    SupportedLanguage.HINDI: {"lang": "hi", "ocr_version": "PP-OCRv5"},
+}
+
+
+class PaddleOCRv4Model(BaseOCRModel):
+    name = "paddleocr_v4"
+    supported_languages = [
+        SupportedLanguage.ENGLISH,
+        SupportedLanguage.ARABIC,
+        SupportedLanguage.HINDI,
+    ]
+    tier = 2
+
+    def __init__(self, use_gpu: bool = False):
+        self.use_gpu = use_gpu
+        self._engines = {}   # one engine per language (PaddleOCR is not multi-lang per instance)
+
+    def supports_all_languages(self) -> bool:
+        return True
+
+    async def load(self) -> None:
+        from paddleocr import PaddleOCR
+        device = "gpu" if self.use_gpu else "cpu"
+        for lang_enum, config in LANG_CONFIG.items():
+            paddle_lang = config["lang"]
+            ocr_version = config["ocr_version"]
+            logger.info(f"[PaddleOCR] Loading engine for lang={paddle_lang}, ocr_version={ocr_version}")
+            self._engines[lang_enum] = PaddleOCR(
+                use_textline_orientation=True,
+                lang=paddle_lang,
+                device=device,
+                ocr_version=ocr_version,
+            )
+        logger.info("[PaddleOCR] All language engines loaded.")
+
+    async def unload(self) -> None:
+        self._engines.clear()
+
+    @staticmethod
+    def _to_xyxy_bbox(poly) -> list[int]:
+        """Convert polygon/box outputs into [x1, y1, x2, y2]."""
+        if poly is None:
+            return [0, 0, 0, 0]
+        try:
+            if len(poly) == 0:
+                return [0, 0, 0, 0]
+        except TypeError:
+            return [0, 0, 0, 0]
+        xs = [int(float(p[0])) for p in poly]
+        ys = [int(float(p[1])) for p in poly]
+        return [min(xs), min(ys), max(xs), max(ys)]
+
+    def _parse_ocr_page(self, page_result):
+        """
+        Parse one PaddleOCR page result.
+        Supports both legacy tuple format and PaddleOCR 3.x dict format.
+        """
+        parsed = []
+
+        # PaddleOCR 3.x: dict keys like rec_texts / rec_scores / dt_polys
+        if isinstance(page_result, dict):
+            texts = page_result.get("rec_texts") or []
+            scores = page_result.get("rec_scores") or []
+            polys = page_result.get("dt_polys") or page_result.get("rec_polys") or []
+
+            count = min(len(texts), len(scores), len(polys))
+            for i in range(count):
+                parsed.append((str(texts[i]), float(scores[i]), self._to_xyxy_bbox(polys[i])))
+            return parsed
+
+        # PaddleOCR 2.x legacy: [[bbox, (text, conf)], ...]
+        if isinstance(page_result, list):
+            for line in page_result:
+                if not (isinstance(line, (list, tuple)) and len(line) >= 2):
+                    continue
+                bbox = line[0]
+                text_conf = line[1]
+                if not (isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2):
+                    continue
+                text, conf = text_conf[0], text_conf[1]
+                parsed.append((str(text), float(conf), self._to_xyxy_bbox(bbox)))
+            return parsed
+
+        return parsed
+
+    @staticmethod
+    def _page_score(parsed_page) -> float:
+        if not parsed_page:
+            return 0.0
+        return sum(conf for _, conf, _ in parsed_page)
+
+    def _select_all_language_page(self, img_array):
+        best_lang = None
+        best_page = []
+        best_score = -1.0
+        total_elapsed = 0.0
+
+        for lang_enum, engine in self._engines.items():
+            t0 = self._timer()
+            result = engine.ocr(img_array)
+            total_elapsed += self._elapsed_ms(t0)
+
+            parsed_page = self._parse_ocr_page(result[0]) if result and result[0] else []
+            score = self._page_score(parsed_page)
+            if score > best_score:
+                best_score = score
+                best_lang = lang_enum
+                best_page = parsed_page
+
+        return best_lang, best_page, total_elapsed
+
+    async def run(self, image_bytes: bytes, language: SupportedLanguage) -> OCRResult:
+        if language != SupportedLanguage.ALL:
+            engine = self._engines.get(language)
+        else:
+            engine = None
+
+        if language != SupportedLanguage.ALL and not engine:
+            return OCRResult.from_error(self.name, language.value, f"Language {language} not loaded")
+
+        try:
+            words = []
+            page_texts = []
+            total_elapsed = 0.0
+            pages = load_document_as_rgb_images(image_bytes)
+            resolved_page_languages = []
+
+            for image in pages:
+                img_array = np.array(image)
+                if language == SupportedLanguage.ALL:
+                    page_language, parsed_page, page_elapsed = self._select_all_language_page(img_array)
+                    total_elapsed += page_elapsed
+                    resolved_page_languages.append(page_language.value if page_language else None)
+                else:
+                    t0 = self._timer()
+                    result = engine.ocr(img_array)
+                    total_elapsed += self._elapsed_ms(t0)
+                    parsed_page = self._parse_ocr_page(result[0]) if result and result[0] else []
+
+                lines = []
+                for text, conf, flat_bbox in parsed_page:
+                    words.append(OCRWord(text=text, confidence=conf, bbox=flat_bbox))
+                    lines.append(text)
+                page_texts.append("\n".join(lines))
+
+            raw_text = "\n\n".join(text for text in page_texts if text)
+            avg_conf = sum(w.confidence for w in words) / len(words) if words else 0.0
+            metadata = {"page_count": len(pages)}
+            if language == SupportedLanguage.ALL:
+                metadata["best_effort_language_mode"] = "best_single_language_engine_per_page"
+                metadata["resolved_page_languages"] = resolved_page_languages
+
+            return OCRResult(
+                model_name=self.name,
+                language=language.value,
+                raw_text=raw_text,
+                words=words,
+                inference_time_ms=round(total_elapsed, 2),
+                avg_confidence=round(avg_conf, 4),
+                metadata=metadata,
+            )
+
+        except Exception as e:
+            logger.exception(f"[PaddleOCR] Inference error: {e}")
+            return OCRResult.from_error(self.name, language.value, str(e))

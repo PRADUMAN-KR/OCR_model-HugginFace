@@ -1,0 +1,10 @@
+tensorflow>=2.16
+tf-keras          # legacy Keras 2 shim required by keras-ocr 0.9.3 on TF ≥ 2.16
+keras-ocr==0.9.3
+numpy==1.26.4
+opencv-python-headless==4.8.1.78
+pillow
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-multipart

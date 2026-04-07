@@ -1,0 +1,7 @@
+torch==2.9.0
+torchvision==0.24.0
+easyocr==1.7.1
+numpy>=2.0
+opencv-python-headless>=4.13
+pillow
+scikit-image
