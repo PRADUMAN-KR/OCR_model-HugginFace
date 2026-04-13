@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     PADDLE_USE_GPU: bool = False   # GPU for PaddleOCR models — set False for Blackwell (SM 120) until PaddlePaddle adds support
     GPU_DEVICE_ID: int = 0
 
+    # F2 pipeline debug visualisations
+    # Set to a directory path to save stage images on every inference call.
+    # Leave empty to disable (default — no overhead in production).
+    PADDLE_DEBUG_OUTPUT_DIR: str = ""
+
     # Inference timeouts (seconds)
     MODEL_TIMEOUT: int = 60
     BENCHMARK_TIMEOUT: int = 300

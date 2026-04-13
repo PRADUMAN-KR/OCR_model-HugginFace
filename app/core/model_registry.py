@@ -62,7 +62,10 @@ class ModelRegistry:
         if name == "paddleocr_v4":
             from app.models.paddleocr_v4 import PaddleOCRv4Model
 
-            return PaddleOCRv4Model(use_gpu=settings.PADDLE_USE_GPU)
+            return PaddleOCRv4Model(
+                use_gpu=settings.PADDLE_USE_GPU,
+                debug_output_dir=settings.PADDLE_DEBUG_OUTPUT_DIR or None,
+            )
 
         if name == "easyocr":
             from app.models.easyocr_model import EasyOCRModel
