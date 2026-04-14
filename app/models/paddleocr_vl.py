@@ -53,7 +53,10 @@ class PaddleOCRVLModel(BaseOCRModel):
                 device=device,
                 ocr_version=ocr_version,
                 use_doc_orientation_classify=True,
-                use_doc_unwarping=True,         # VL-specific: handles curved/distorted docs
+                use_doc_unwarping=True,
+                text_det_thresh=0.5,
+                text_det_box_thresh=0.7,
+                text_rec_score_thresh=0.5,
             )
         logger.info("[PaddleOCR-VL] All language engines loaded.")
 
@@ -74,26 +77,24 @@ class PaddleOCRVLModel(BaseOCRModel):
         ys = [int(float(p[1])) for p in poly]
         return [min(xs), min(ys), max(xs), max(ys)]
 
+    MIN_BOX_AREA = 150
+    MIN_BOX_HEIGHT = 8
+
     def _parse_ocr_page(self, page_result):
         """
         Parse one PaddleOCR page result.
         Supports both legacy tuple format and PaddleOCR 3.x dict format.
+        Filters out tiny/spurious boxes.
         """
-        parsed = []
+        raw = []
 
-        # PaddleOCR 3.x: dict keys like rec_texts / rec_scores / dt_polys
         if isinstance(page_result, dict):
             texts = page_result.get("rec_texts") or []
             scores = page_result.get("rec_scores") or []
             polys = page_result.get("dt_polys") or page_result.get("rec_polys") or []
-
-            count = min(len(texts), len(scores), len(polys))
-            for i in range(count):
-                parsed.append((str(texts[i]), float(scores[i]), self._to_xyxy_bbox(polys[i])))
-            return parsed
-
-        # PaddleOCR 2.x legacy: [[bbox, (text, conf)], ...]
-        if isinstance(page_result, list):
+            for i in range(min(len(texts), len(scores), len(polys))):
+                raw.append((str(texts[i]), float(scores[i]), self._to_xyxy_bbox(polys[i])))
+        elif isinstance(page_result, list):
             for line in page_result:
                 if not (isinstance(line, (list, tuple)) and len(line) >= 2):
                     continue
@@ -101,10 +102,16 @@ class PaddleOCRVLModel(BaseOCRModel):
                 text_conf = line[1]
                 if not (isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2):
                     continue
-                text, conf = text_conf[0], text_conf[1]
-                parsed.append((str(text), float(conf), self._to_xyxy_bbox(bbox)))
-            return parsed
+                raw.append((str(text_conf[0]), float(text_conf[1]), self._to_xyxy_bbox(bbox)))
 
+        parsed = []
+        for text, conf, (x1, y1, x2, y2) in raw:
+            w, h = x2 - x1, y2 - y1
+            if w * h < self.MIN_BOX_AREA or h < self.MIN_BOX_HEIGHT:
+                continue
+            if not text or not text.strip():
+                continue
+            parsed.append((text, conf, [x1, y1, x2, y2]))
         return parsed
 
     @staticmethod
