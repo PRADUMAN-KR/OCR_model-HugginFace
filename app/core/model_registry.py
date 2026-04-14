@@ -65,6 +65,16 @@ class ModelRegistry:
             return PaddleOCRv4Model(
                 use_gpu=settings.PADDLE_USE_GPU,
                 debug_output_dir=settings.PADDLE_DEBUG_OUTPUT_DIR or None,
+                enable_arabic_v3_fallback=settings.PADDLE_ARABIC_V3_FALLBACK,
+                always_run_both_arabic_engines=settings.PADDLE_ARABIC_RUN_BOTH_ENGINES,
+                fallback_min_lines=settings.PADDLE_F2_FALLBACK_MIN_LINES,
+                fallback_min_chars=settings.PADDLE_F2_FALLBACK_MIN_CHARS,
+                fallback_min_avg_conf=settings.PADDLE_F2_FALLBACK_MIN_AVG_CONF,
+                fallback_min_ar_ratio=settings.PADDLE_F2_FALLBACK_MIN_ARABIC_RATIO,
+                fallback_replace_margin=settings.PADDLE_F2_FALLBACK_REPLACE_MARGIN,
+                input_roi_warp=settings.PADDLE_INPUT_ROI_WARP,
+                roi_min_area_ratio=settings.PADDLE_ROI_MIN_AREA_RATIO,
+                roi_pad_ratio=settings.PADDLE_ROI_PAD_RATIO,
             )
 
         if name == "easyocr":

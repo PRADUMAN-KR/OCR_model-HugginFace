@@ -3,22 +3,17 @@ PaddleOCR PP-OCRv4/v5 — Tier 2
 
 Standard pipeline + F2 MAX-ACCURACY pipeline (enabled when max_accuracy=True):
 
-  Stage 1 — Generate full-page image variants (original, 2x upscale, CLAHE,
-             sharpened, denoised)
-  Stage 2 — Run full engine.ocr() on each variant × each engine.
-             Arabic: PP-OCRv5 primary + PP-OCRv3 secondary → 5 × 2 = 10 passes
-  Stage 3 — Align results across passes by bbox IoU and pick best candidate
-             per text line
-  Stage 4 — Candidate scoring (model confidence × Arabic char ratio ×
-             repeated-char penalty × length sanity)
-  Stage 5 — Arabic language-model correction (diacritic stripping, Alef /
-             Teh-marbuta / Alef-maqsura normalisation, zero-width cleanup)
+  Stage 1 — Full-page variants (original, 2x, CLAHE, sharpened, denoised)
+  Stage 2 — Run full engine.ocr() on each variant × each engine
+  Stage 3 — Pick best complete pass (scored; upscaled variant lightly penalised)
+  Stage 4+5 — Arabic line order (RTL within bands) + light text cleanup
 
 Supports: English, Arabic, Hindi
 Install:  pip install paddlepaddle paddleocr opencv-python
 """
 
 import logging
+import math
 import re
 import unicodedata
 from datetime import datetime
@@ -38,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 LANG_CONFIG: dict[SupportedLanguage, dict] = {
-    SupportedLanguage.ENGLISH: {"lang": "en", "ocr_version": "PP-OCRv4"},
+    SupportedLanguage.ENGLISH: {"lang": "en", "ocr_version": "PP-OCRv5"},
     SupportedLanguage.ARABIC:  {"lang": "ar", "ocr_version": "PP-OCRv5"},
     SupportedLanguage.HINDI:   {"lang": "hi", "ocr_version": "PP-OCRv5"},
 }
@@ -70,6 +65,9 @@ _ARABIC_CLEANUP_MAP = str.maketrans({
 
 _RE_REPEATED = re.compile(r"(.)\1{4,}")
 
+# Vertical band tolerance (px) for grouping boxes on the same text line (Arabic RTL sort).
+_ARABIC_LINE_BAND_TOL_PX = 15
+
 
 # ---------------------------------------------------------------------------
 # Model class
@@ -97,10 +95,33 @@ class PaddleOCRv4Model(BaseOCRModel):
         use_gpu: bool = False,
         max_accuracy: bool = True,
         debug_output_dir: str | None = None,
+        enable_arabic_v3_fallback: bool = False,
+        always_run_both_arabic_engines: bool = False,
+        fallback_min_lines: int = 4,
+        fallback_min_chars: int = 80,
+        fallback_min_avg_conf: float = 0.72,
+        fallback_min_ar_ratio: float = 0.60,
+        fallback_replace_margin: float = 0.03,
+        input_roi_warp: bool = False,
+        roi_min_area_ratio: float = 0.15,
+        roi_pad_ratio: float = 0.02,
     ):
         self.use_gpu = use_gpu
         self.max_accuracy = max_accuracy
         self.debug_output_dir = debug_output_dir
+        # Optional Arabic v3 fallback (disabled by default to save VRAM).
+        self.enable_arabic_v3_fallback = enable_arabic_v3_fallback
+        # If enabled, always run both Arabic engines (v5 + v3) for comparison.
+        self.always_run_both_arabic_engines = always_run_both_arabic_engines
+        self.fallback_min_lines = fallback_min_lines
+        self.fallback_min_chars = fallback_min_chars
+        self.fallback_min_avg_conf = fallback_min_avg_conf
+        self.fallback_min_ar_ratio = fallback_min_ar_ratio
+        self.fallback_replace_margin = fallback_replace_margin
+        # Optional: largest-quad perspective warp before OCR (napkin / document on clutter).
+        self.input_roi_warp = input_roi_warp
+        self.roi_min_area_ratio = roi_min_area_ratio
+        self.roi_pad_ratio = roi_pad_ratio
         # Primary full-pipeline engines (one per language)
         self._engines: dict[SupportedLanguage, object] = {}
         # F2: alternate-version full-pipeline engines per language
@@ -125,8 +146,8 @@ class PaddleOCRv4Model(BaseOCRModel):
             logger.info("[PaddleOCR] Loading engine: lang=%s version=%s", paddle_lang, ocr_version)
             self._engines[lang_enum] = PaddleOCR(
                 use_textline_orientation=True,
-                use_doc_orientation_classify=True,
-                use_doc_unwarping=True,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
                 lang=paddle_lang,
                 device=device,
                 ocr_version=ocr_version,
@@ -138,15 +159,19 @@ class PaddleOCRv4Model(BaseOCRModel):
             if not self.max_accuracy:
                 continue
 
-            # Load alternate-version engines for multi-engine diversity
+            # Load alternate-version engines only when a mode needs them.
+            if not (self.enable_arabic_v3_fallback or self.always_run_both_arabic_engines):
+                continue
+
+            # Load alternate-version engines for fallback.
             alt_list: list[tuple[str, object]] = []
             for alt_ver in _ALT_ENGINES.get(lang_enum, []):
                 try:
                     logger.info("[PaddleOCR F2] Loading alt engine: lang=%s version=%s", paddle_lang, alt_ver)
                     alt_engine = PaddleOCR(
                         use_textline_orientation=True,
-                        use_doc_orientation_classify=True,
-                        use_doc_unwarping=True,
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
                         lang=paddle_lang,
                         device=device,
                         ocr_version=alt_ver,
@@ -166,11 +191,105 @@ class PaddleOCRv4Model(BaseOCRModel):
                 )
 
         n_engines = 1 + len(self._alt_engines.get(SupportedLanguage.ARABIC, []))
-        logger.info("[PaddleOCR] All engines loaded. F2 passes/variant: %d", n_engines)
+        logger.info(
+            "[PaddleOCR] All engines loaded. F2 passes/variant: %d | ar_v3_fallback=%s | ar_run_both=%s",
+            n_engines, self.enable_arabic_v3_fallback, self.always_run_both_arabic_engines,
+        )
 
     async def unload(self) -> None:
         self._engines.clear()
         self._alt_engines.clear()
+
+    # ------------------------------------------------------------------
+    # Input pipeline — document ROI (before detection)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _order_quad_points(pts: np.ndarray) -> np.ndarray:
+        """Order 4 points as tl, tr, br, bl (OpenCV doc-scanner convention)."""
+        pts = pts.reshape(4, 2).astype(np.float32)
+        rect = np.zeros((4, 2), dtype=np.float32)
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1).flatten()
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+
+    def _apply_document_roi_warp(self, img_rgb: np.ndarray) -> tuple[np.ndarray, dict]:
+        """
+        Find largest plausible document quad (Canny → contours → approxPoly)
+        and apply perspective warp. Falls back to original image on failure.
+        """
+        meta: dict = {"roi_warp_applied": False, "roi_warp_reason": "disabled"}
+        if not self.input_roi_warp:
+            return img_rgb, meta
+
+        h, w = img_rgb.shape[:2]
+        img_area = float(h * w)
+        if img_area < 5000:
+            meta["roi_warp_reason"] = "image_too_small"
+            return img_rgb, meta
+
+        bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(gray, 50, 150)
+        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+
+        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            meta["roi_warp_reason"] = "no_contours"
+            return img_rgb, meta
+
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+        min_area = self.roi_min_area_ratio * img_area
+        quad = None
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                break
+            peri = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+            if len(approx) == 4 and cv2.isContourConvex(approx):
+                quad = approx.reshape(4, 2)
+                break
+
+        if quad is None:
+            meta["roi_warp_reason"] = "no_suitable_quad"
+            return img_rgb, meta
+
+        ordered = self._order_quad_points(quad)
+        (tl, tr, br, bl) = ordered
+        width_a = np.linalg.norm(br - bl)
+        width_b = np.linalg.norm(tr - tl)
+        max_w = int(max(width_a, width_b))
+        height_a = np.linalg.norm(tr - br)
+        height_b = np.linalg.norm(tl - bl)
+        max_h = int(max(height_a, height_b))
+        max_w = max(max_w, 32)
+        max_h = max(max_h, 32)
+
+        dst = np.array(
+            [[0, 0], [max_w - 1, 0], [max_w - 1, max_h - 1], [0, max_h - 1]],
+            dtype=np.float32,
+        )
+        m = cv2.getPerspectiveTransform(ordered, dst)
+        warped_bgr = cv2.warpPerspective(bgr, m, (max_w, max_h))
+        pad = max(2, int(self.roi_pad_ratio * max(max_w, max_h)))
+        warped_bgr = cv2.copyMakeBorder(
+            warped_bgr, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(255, 255, 255),
+        )
+        out_rgb = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2RGB)
+        meta["roi_warp_applied"] = True
+        meta["roi_warp_reason"] = "ok"
+        meta["roi_warp_size"] = [out_rgb.shape[1], out_rgb.shape[0]]
+        logger.info(
+            "[PaddleOCR] ROI warp applied: %dx%d → %dx%d (pad=%d)",
+            w, h, out_rgb.shape[1], out_rgb.shape[0], pad,
+        )
+        return out_rgb, meta
 
     # ------------------------------------------------------------------
     # Stage 1 — Full-page preprocessing variants
@@ -215,7 +334,11 @@ class PaddleOCRv4Model(BaseOCRModel):
     # ------------------------------------------------------------------
 
     def _run_all_passes(
-        self, img_rgb: np.ndarray, lang_enum: SupportedLanguage
+        self,
+        img_rgb: np.ndarray,
+        lang_enum: SupportedLanguage,
+        include_primary: bool = True,
+        include_alt: bool = False,
     ) -> list[tuple[str, str, list[tuple[str, float, list[int]]]]]:
         """
         Run every (variant × engine) combination.
@@ -229,9 +352,14 @@ class PaddleOCRv4Model(BaseOCRModel):
         if not primary_engine:
             return []
 
-        primary_ver = LANG_CONFIG[lang_enum]["ocr_version"]
-        engines: list[tuple[str, object]] = [(primary_ver, primary_engine)]
-        engines.extend(self._alt_engines.get(lang_enum, []))
+        engines: list[tuple[str, object]] = []
+        if include_primary:
+            primary_ver = LANG_CONFIG[lang_enum]["ocr_version"]
+            engines.append((primary_ver, primary_engine))
+        if include_alt:
+            engines.extend(self._alt_engines.get(lang_enum, []))
+        if not engines:
+            return []
 
         all_passes: list[tuple[str, str, list[tuple[str, float, list[int]]]]] = []
 
@@ -275,22 +403,87 @@ class PaddleOCRv4Model(BaseOCRModel):
             if "\u0600" <= c <= "\u06FF"
             or "\u0750" <= c <= "\u077F"
             or "\uFB50" <= c <= "\uFDFF"
+            or "\uFE70" <= c <= "\uFEFF"
         )
         return arabic / len(text)
+
+    @staticmethod
+    def _sort_lines_reading_order(
+        items: list[tuple[str, float, list[int]]],
+        language: SupportedLanguage,
+        band_tol: int = _ARABIC_LINE_BAND_TOL_PX,
+    ) -> list[tuple[str, float, list[int]]]:
+        """
+        Reading order: English/Hindi — top-to-bottom by line (y).
+        Arabic — same vertical bands, then right-to-left within each band.
+        """
+        if not items:
+            return []
+        if language != SupportedLanguage.ARABIC:
+            return sorted(items, key=lambda r: ((r[2][1] + r[2][3]) / 2, r[2][0]))
+
+        by_y = sorted(items, key=lambda r: (r[2][1] + r[2][3]) / 2)
+        bands: list[list[tuple[str, float, list[int]]]] = []
+        cur: list[tuple[str, float, list[int]]] = [by_y[0]]
+        ref_cy = (cur[0][2][1] + cur[0][2][3]) / 2
+        for it in by_y[1:]:
+            cy = (it[2][1] + it[2][3]) / 2
+            if abs(cy - ref_cy) < band_tol:
+                cur.append(it)
+            else:
+                bands.append(cur)
+                cur = [it]
+                ref_cy = cy
+        bands.append(cur)
+
+        out: list[tuple[str, float, list[int]]] = []
+        for band in bands:
+            out.extend(sorted(band, key=lambda r: r[2][0], reverse=True))
+        return out
+
+    @staticmethod
+    def _sort_f2_results_reading_order(
+        results: list[tuple[str, str, float, list[int]]],
+        language: SupportedLanguage,
+        band_tol: int = _ARABIC_LINE_BAND_TOL_PX,
+    ) -> list[tuple[str, str, float, list[int]]]:
+        """Same as _sort_lines_reading_order but for F2 (text_raw, text_corr, conf, bbox)."""
+        if not results:
+            return []
+        if language != SupportedLanguage.ARABIC:
+            return sorted(
+                results,
+                key=lambda r: ((r[3][1] + r[3][3]) / 2, r[3][0]),
+            )
+        by_y = sorted(results, key=lambda r: (r[3][1] + r[3][3]) / 2)
+        bands: list[list[tuple[str, str, float, list[int]]]] = []
+        cur = [by_y[0]]
+        ref_cy = (cur[0][3][1] + cur[0][3][3]) / 2
+        for it in by_y[1:]:
+            cy = (it[3][1] + it[3][3]) / 2
+            if abs(cy - ref_cy) < band_tol:
+                cur.append(it)
+            else:
+                bands.append(cur)
+                cur = [it]
+                ref_cy = cy
+        bands.append(cur)
+        out: list[tuple[str, str, float, list[int]]] = []
+        for band in bands:
+            out.extend(sorted(band, key=lambda r: r[3][0], reverse=True))
+        return out
 
     def _score_pass(
         self,
         parsed: list[tuple[str, float, list[int]]],
         language: SupportedLanguage,
+        variant_name: str | None = None,
     ) -> float:
         """
         Score an entire pass result.  Higher = better.
 
-        Factors:
-          • total_text_length — more text captured = more complete
-          • mean_confidence   — higher confidence = more reliable
-          • arabic_char_ratio — for Arabic, penalise non-Arabic junk
-          • repeated-char penalty
+        Uses sqrt(length) × mean_conf to reduce pure length bias (2× upscales
+        often add extra boxes). ``upscaled_2x`` gets a small extra penalty.
         """
         if not parsed:
             return 0.0
@@ -302,7 +495,10 @@ class PaddleOCRv4Model(BaseOCRModel):
         total_len = len(total_text)
         mean_conf = sum(c for _, c, _ in parsed) / len(parsed)
 
-        score = total_len * mean_conf
+        score = math.sqrt(max(1.0, float(total_len))) * mean_conf
+
+        if variant_name == "upscaled_2x":
+            score *= 0.88
 
         if _RE_REPEATED.search(total_text):
             score *= 0.5
@@ -320,12 +516,12 @@ class PaddleOCRv4Model(BaseOCRModel):
         self,
         all_passes: list[tuple[str, str, list[tuple[str, float, list[int]]]]],
         language: SupportedLanguage,
-    ) -> tuple[str, str, list[tuple[str, float, list[int]]]]:
+    ) -> tuple[str, str, list[tuple[str, float, list[int]]], float]:
         """Pick the single pass whose full-page result is best."""
         best_pass = ("", "", [])
         best_score = -1.0
         for variant_name, engine_name, parsed in all_passes:
-            s = self._score_pass(parsed, language)
+            s = self._score_pass(parsed, language, variant_name)
             logger.debug(
                 "[PaddleOCR F2] Pass score: %s × %s → %.1f (%d lines)",
                 variant_name, engine_name, s, len(parsed),
@@ -339,7 +535,38 @@ class PaddleOCRv4Model(BaseOCRModel):
             "[PaddleOCR F2] Stage 3: Best pass = %s × %s (score %.1f)",
             vname, ename, best_score,
         )
-        return best_pass
+        return best_pass[0], best_pass[1], best_pass[2], best_score
+
+    def _should_trigger_arabic_fallback(
+        self,
+        parsed: list[tuple[str, float, list[int]]],
+    ) -> tuple[bool, list[str]]:
+        """
+        Decide whether to run the optional PP-OCRv3 fallback.
+        Confidence alone is not used; we combine structure/coverage signals.
+        """
+        reasons: list[str] = []
+        if not parsed:
+            return True, ["empty_primary_result"]
+
+        line_count = len(parsed)
+        total_text = " ".join(t.strip() for t, _, _ in parsed if t.strip())
+        total_chars = len(total_text)
+        avg_conf = sum(c for _, c, _ in parsed) / line_count if line_count else 0.0
+        ar_ratio = self._arabic_char_ratio(total_text) if total_text else 0.0
+
+        if line_count < self.fallback_min_lines:
+            reasons.append(f"low_line_count<{self.fallback_min_lines}")
+        if total_chars < self.fallback_min_chars:
+            reasons.append(f"low_char_count<{self.fallback_min_chars}")
+        if avg_conf < self.fallback_min_avg_conf:
+            reasons.append(f"low_avg_conf<{self.fallback_min_avg_conf:.2f}")
+        if ar_ratio < self.fallback_min_ar_ratio:
+            reasons.append(f"low_arabic_ratio<{self.fallback_min_ar_ratio:.2f}")
+        if _RE_REPEATED.search(total_text):
+            reasons.append("repeated_char_pattern")
+
+        return (len(reasons) > 0), reasons
 
     # ------------------------------------------------------------------
     # Stage 5 — Arabic language-model correction
@@ -349,6 +576,8 @@ class PaddleOCRv4Model(BaseOCRModel):
     def _arabic_correct(text: str) -> str:
         text = unicodedata.normalize("NFC", text)
         text = text.translate(_ARABIC_CLEANUP_MAP)
+        # Presentation forms (e.g. ﻛ → ك) — normalize after NFC per Unicode guidance
+        text = unicodedata.normalize("NFKC", text)
         return text.strip()
 
     # ------------------------------------------------------------------
@@ -363,11 +592,31 @@ class PaddleOCRv4Model(BaseOCRModel):
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(img_rgb)
         draw = ImageDraw.Draw(pil_img)
+
+        draw_text = text
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            import arabic_reshaper  # type: ignore[import-untyped]
+            from bidi.algorithm import get_display  # type: ignore[import-untyped]
+
+            if any("\u0600" <= c <= "\u06FF" for c in text):
+                draw_text = get_display(arabic_reshaper.reshape(text))
         except Exception:
-            font = ImageFont.load_default()
-        draw.text(xy, text, font=font, fill=color)
+            pass
+
+        font = ImageFont.load_default()
+        for fp in (
+            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/arabic/NotoNaskhArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/fonts-arabeyes/ae_AlArabiya.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ):
+            try:
+                font = ImageFont.truetype(fp, font_size)
+                break
+            except Exception:
+                continue
+
+        draw.text(xy, draw_text, font=font, fill=color)
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     def _get_debug_dir(self) -> Path | None:
@@ -438,7 +687,7 @@ class PaddleOCRv4Model(BaseOCRModel):
         img_rgb: np.ndarray,
         lang_enum: SupportedLanguage,
         debug_run_id: str | None = None,
-    ) -> tuple[list[tuple[str, str, float, list[int]]], dict[str, str]]:
+    ) -> tuple[list[tuple[str, str, float, list[int]]], dict[str, str], dict]:
         """
         Full-page multi-pass F2 pipeline.
 
@@ -451,15 +700,105 @@ class PaddleOCRv4Model(BaseOCRModel):
           results     — list of (text_raw, text_corrected, confidence, bbox)
           debug_paths — dict of saved visualisation file paths
         """
-        # Stage 1+2: generate page variants, run full ocr on each
-        all_passes = self._run_all_passes(img_rgb, lang_enum)
-        if not all_passes:
-            return [], {}
+        diagnostics: dict = {
+            "selected_variant": None,
+            "selected_engine": None,
+            "primary_best_score": None,
+            "alt_best_score": None,
+            "comparison_mode": "primary_only",
+            "fallback_triggered": False,
+            "fallback_reasons": [],
+            "primary_response_raw_text": "",
+            "primary_response_corrected_text": "",
+            "alt_response_raw_text": "",
+            "alt_response_corrected_text": "",
+        }
 
-        # Stage 3: pick the best complete pass
-        best_variant, best_engine, best_parsed = self._select_best_pass(
-            all_passes, lang_enum
+        # Stage 1+2 (primary): generate variants, run primary engine only
+        primary_passes = self._run_all_passes(
+            img_rgb, lang_enum, include_primary=True, include_alt=False
         )
+        if not primary_passes:
+            return [], {}, diagnostics
+
+        # Stage 3: pick the best complete primary pass
+        best_variant, best_engine, best_parsed, best_score = self._select_best_pass(
+            primary_passes, lang_enum
+        )
+        diagnostics["primary_best_score"] = round(best_score, 3)
+
+        primary_sorted = self._sort_lines_reading_order(best_parsed, lang_enum)
+        diagnostics["primary_response_raw_text"] = "\n".join(
+            t for t, _, _ in primary_sorted if t and t.strip()
+        )
+        diagnostics["primary_response_corrected_text"] = "\n".join(
+            (
+                self._arabic_correct(t)
+                if lang_enum == SupportedLanguage.ARABIC
+                else t
+            )
+            for t, _, _ in primary_sorted
+            if t and t.strip()
+        )
+
+        all_pass_count = len(primary_passes)
+
+        # Optional Arabic v3 execution modes:
+        # 1) always_run_both_arabic_engines=True  -> always compare v5 vs v3
+        # 2) enable_arabic_v3_fallback=True       -> run v3 only on weak v5 signal
+        if lang_enum == SupportedLanguage.ARABIC and self._alt_engines.get(lang_enum):
+            should_run_alt = False
+            reasons: list[str] = []
+            if self.always_run_both_arabic_engines:
+                should_run_alt = True
+                diagnostics["comparison_mode"] = "always_compare_v5_v3"
+                reasons = ["always_compare_enabled"]
+            elif self.enable_arabic_v3_fallback:
+                # When fallback mode is enabled, always run v3 too so user can
+                # benchmark both outputs manually from metadata.
+                diagnostics["comparison_mode"] = "fallback_enabled_with_dual_output"
+                should_run_alt = True
+                trigger, reasons = self._should_trigger_arabic_fallback(best_parsed)
+                diagnostics["fallback_triggered"] = trigger
+                diagnostics["fallback_reasons"] = reasons
+
+            if should_run_alt:
+                logger.info(
+                    "[PaddleOCR F2] Running alt engine passes (%s).",
+                    ", ".join(reasons),
+                )
+                alt_passes = self._run_all_passes(
+                    img_rgb, lang_enum, include_primary=False, include_alt=True
+                )
+                all_pass_count += len(alt_passes)
+                if alt_passes:
+                    alt_variant, alt_engine, alt_parsed, alt_score = self._select_best_pass(
+                        alt_passes, lang_enum
+                    )
+                    diagnostics["alt_best_score"] = round(alt_score, 3)
+                    alt_sorted = self._sort_lines_reading_order(alt_parsed, lang_enum)
+                    diagnostics["alt_response_raw_text"] = "\n".join(
+                        t for t, _, _ in alt_sorted if t and t.strip()
+                    )
+                    diagnostics["alt_response_corrected_text"] = "\n".join(
+                        self._arabic_correct(t) for t, _, _ in alt_sorted if t and t.strip()
+                    )
+                    if alt_score > best_score * (1.0 + self.fallback_replace_margin):
+                        logger.info(
+                            "[PaddleOCR F2] Winner selected from alt engine: %s × %s (%.1f > %.1f)",
+                            alt_variant, alt_engine, alt_score, best_score,
+                        )
+                        best_variant, best_engine, best_parsed, best_score = (
+                            alt_variant,
+                            alt_engine,
+                            alt_parsed,
+                            alt_score,
+                        )
+                    else:
+                        logger.info(
+                            "[PaddleOCR F2] Keeping primary winner (%s × %s). Alt score %.1f not above margin.",
+                            best_variant, best_engine, alt_score
+                        )
 
         # Stage 4+5: apply Arabic correction to the winning pass
         results: list[tuple[str, str, float, list[int]]] = []
@@ -474,12 +813,21 @@ class PaddleOCRv4Model(BaseOCRModel):
             if text_corrected:
                 results.append((text_raw, text_corrected, conf, bbox))
 
-        # Sort results top-to-bottom by y1 coordinate
-        results.sort(key=lambda r: r[3][1])
+        results = self._sort_f2_results_reading_order(results, lang_enum)
 
         logger.info(
             "[PaddleOCR F2] Pipeline done: %d lines (best pass: %s × %s, from %d total passes)",
-            len(results), best_variant, best_engine, len(all_passes),
+            len(results), best_variant, best_engine, all_pass_count,
+        )
+        diagnostics["selected_variant"] = best_variant
+        diagnostics["selected_engine"] = best_engine
+        logger.info(
+            "[PaddleOCR F2] Selected response source: engine=%s variant=%s mode=%s primary_score=%s alt_score=%s",
+            diagnostics["selected_engine"],
+            diagnostics["selected_variant"],
+            diagnostics["comparison_mode"],
+            diagnostics["primary_best_score"],
+            diagnostics["alt_best_score"],
         )
 
         # Debug visualisation
@@ -491,7 +839,7 @@ class PaddleOCRv4Model(BaseOCRModel):
             except Exception as exc:
                 logger.warning("[PaddleOCR F2 VIS] Visualisation failed: %s", exc)
 
-        return results, debug_paths
+        return results, debug_paths, diagnostics
 
     # ------------------------------------------------------------------
     # Shared helpers
@@ -588,9 +936,13 @@ class PaddleOCRv4Model(BaseOCRModel):
 
             run_id    = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             all_debug: dict[str, str] = {}
+            f2_page_diagnostics: list[dict] = []
+            input_pipeline_pages: list[dict] = []
 
             for page_idx, image in enumerate(pages):
                 img_array = np.array(image)
+                img_array, prep_meta = self._apply_document_roi_warp(img_array)
+                input_pipeline_pages.append(prep_meta)
 
                 if language == SupportedLanguage.ALL:
                     page_lang, parsed_std, page_elapsed = self._select_all_language_page(img_array)
@@ -605,11 +957,12 @@ class PaddleOCRv4Model(BaseOCRModel):
                 elif f2_active:
                     t0 = self._timer()
                     page_debug_id = f"{run_id}_p{page_idx}"
-                    f2_page, debug_paths = self._run_f2_pipeline(
+                    f2_page, debug_paths, diag = self._run_f2_pipeline(
                         img_array, language, debug_run_id=page_debug_id
                     )
                     total_elapsed += self._elapsed_ms(t0)
                     all_debug.update({f"p{page_idx}_{k}": v for k, v in debug_paths.items()})
+                    f2_page_diagnostics.append(diag)
                     lines, lines_raw = [], []
                     for text_raw, text_corrected, conf, flat_bbox in f2_page:
                         words.append(OCRWord(text=text_corrected, confidence=conf, bbox=flat_bbox))
@@ -641,6 +994,10 @@ class PaddleOCRv4Model(BaseOCRModel):
             }
             if all_debug:
                 metadata["debug_visualizations"] = all_debug
+            if f2_page_diagnostics:
+                metadata["f2_page_diagnostics"] = f2_page_diagnostics
+            if input_pipeline_pages:
+                metadata["input_pipeline"] = input_pipeline_pages
             if language == SupportedLanguage.ALL:
                 metadata["best_effort_language_mode"] = "best_single_language_engine_per_page"
                 metadata["resolved_page_languages"]   = resolved_page_languages
