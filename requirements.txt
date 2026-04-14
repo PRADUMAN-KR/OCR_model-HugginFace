@@ -16,6 +16,9 @@ pdf2image
 # Install paddlepaddle/paddlepaddle-gpu separately based on your CUDA/OS from:
 # https://www.paddlepaddle.org.cn/install/quick
 paddleocr>=3.0.0
+# Optional: Arabic debug overlay labels (paddleocr_v4 F2 visualisation)
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2
 easyocr>=1.7.1
 pytesseract>=0.3.13         # Requires: sudo apt install tesseract-ocr
 keras-ocr>=0.9.3
