@@ -1,10 +1,10 @@
 """
-Model Registry — central manager for all OCR model instances.
-Handles lazy loading, GPU allocation, and graceful shutdown.
+Model Registry — loads PaddleOCR at startup.
 """
 
 import logging
 from typing import Dict, List, Optional
+
 from app.models.base import BaseOCRModel
 from app.core.config import settings
 
@@ -75,92 +75,11 @@ class ModelRegistry:
                 input_roi_warp=settings.PADDLE_INPUT_ROI_WARP,
                 roi_min_area_ratio=settings.PADDLE_ROI_MIN_AREA_RATIO,
                 roi_pad_ratio=settings.PADDLE_ROI_PAD_RATIO,
+                arabic_normalize_alef=settings.PADDLE_ARABIC_NORMALIZE_ALEF,
+                arabic_normalize_bidi=settings.PADDLE_ARABIC_NORMALIZE_BIDI,
+                arabic_filter_isolated_letters=settings.PADDLE_ARABIC_FILTER_ISOLATED_LETTERS,
+                arabic_mixed_page_ratio_threshold=settings.PADDLE_ARABIC_MIXED_PAGE_RATIO_THRESHOLD,
             )
-
-        if name == "easyocr":
-            from app.models.easyocr_model import EasyOCRModel
-
-            return EasyOCRModel(use_gpu=settings.USE_GPU)
-
-        if name == "tesseract":
-            from app.models.tesseract_model import TesseractModel
-
-            return TesseractModel()
-
-        if name == "mmocr_crnn":
-            from app.models.mmocr_model import MMOCRModel
-
-            return MMOCRModel(
-                name="mmocr_crnn",
-                rec_model="CRNN",
-                det_model=settings.MMOCR_DET_MODEL,
-                use_gpu=settings.USE_GPU,
-            )
-
-        if name == "mmocr_sar":
-            from app.models.mmocr_model import MMOCRModel
-
-            return MMOCRModel(
-                name="mmocr_sar",
-                rec_model="SAR",
-                det_model=settings.MMOCR_DET_MODEL,
-                use_gpu=settings.USE_GPU,
-            )
-
-        if name == "mmocr_nrtr":
-            from app.models.mmocr_model import MMOCRModel
-
-            return MMOCRModel(
-                name="mmocr_nrtr",
-                rec_model="NRTR",
-                det_model=settings.MMOCR_DET_MODEL,
-                use_gpu=settings.USE_GPU,
-            )
-
-        if name == "keras_ocr":
-            from app.models.keras_ocr_model import KerasOCRModel
-
-            return KerasOCRModel()
-
-        if name == "calamari":
-            from app.models.calamari_model import CalamariModel
-
-            return CalamariModel(
-                checkpoint_path=settings.CALAMARI_CHECKPOINT,
-                checkpoint_en=settings.CALAMARI_CHECKPOINT_EN,
-                checkpoint_ar=settings.CALAMARI_CHECKPOINT_AR,
-                checkpoint_hi=settings.CALAMARI_CHECKPOINT_HI,
-            )
-
-        if name == "kraken":
-            from app.models.kraken_model import KrakenModel
-
-            return KrakenModel(recognition_model_path=settings.KRAKEN_RECOGNITION_MODEL)
-
-        # Tier 1 VLMs — import only when explicitly requested
-        if name == "paddleocr_vl":
-            from app.models.paddleocr_vl import PaddleOCRVLModel
-
-            return PaddleOCRVLModel(use_gpu=settings.PADDLE_USE_GPU)
-
-        if name == "got_ocr2":
-            from app.models.got_ocr2 import GOTOcr2Model
-
-            return GOTOcr2Model(use_gpu=settings.USE_GPU)
-
-        if name == "qwen25_vl":
-            from app.models.qwen25_vl import Qwen25VLModel
-
-            return Qwen25VLModel(
-                use_gpu=settings.USE_GPU,
-                model_size=settings.QWEN_MODEL_SIZE,
-                load_in_4bit=settings.QWEN_LOAD_IN_4BIT,
-            )
-
-        if name == "olmocr2":
-            from app.models.olmocr2 import OlmOCR2Model
-
-            return OlmOCR2Model(use_gpu=settings.USE_GPU)
 
         logger.warning(f"[Registry] Unknown model: {name}")
         return None
