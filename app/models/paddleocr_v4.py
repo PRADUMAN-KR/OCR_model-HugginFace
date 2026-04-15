@@ -3,18 +3,27 @@ PaddleOCR PP-OCRv4/v5 — Tier 2
 
 Standard pipeline + F2 MAX-ACCURACY pipeline (enabled when max_accuracy=True):
 
-  Stage 1 — Full-page variants (original, 2x, CLAHE, sharpened, denoised)
+  Stage 1 — Full-page variants (original, 2x, CLAHE, sharpened, denoised,
+             + Arabic-specific: adaptive_thresh, ink_bleed, deskewed,
+               downscaled_0.75x [for high-DPI inputs])
   Stage 2 — Run full engine.ocr() on each variant × each engine
   Stage 3 — Pick best complete pass (scored; upscaled variant lightly penalised)
-  Stage 4+5 — Arabic line order (RTL within bands) + light text cleanup
+             Score function is Arabic-aware: token-based counting, ligature
+             compensation, mixed-page detection, diacritic-density gating.
+  Stage 4  — Column-aware RTL line ordering with dynamic band tolerance derived
+             from median box height.
+  Stage 5  — Full Arabic text correction: kashida removal, Alef normalization
+             (opt-in), diacritic deduplication, punctuation normalization,
+             isolated-letter noise filtering, ZWNJ/ZWJ/BOM stripping.
 
 Supports: English, Arabic, Hindi
-Install:  pip install paddlepaddle paddleocr opencv-python
+Install:  pip install paddlepaddle paddleocr opencv-python python-bidi arabic-reshaper
 """
 
 import logging
 import math
 import re
+import statistics
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -47,13 +56,10 @@ _ALT_ENGINES: dict[SupportedLanguage, list[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Arabic normalisation table (applied in Stage 5)
+# Arabic normalisation tables and constants (applied in Stage 5)
 # ---------------------------------------------------------------------------
 
-# Only strip invisible / zero-width characters that add no readable value.
-# Diacritics, Hamza variants, Taa-marbuta etc. are intentionally KEPT
-# because the OCR engine already produces correct Arabic and normalising
-# them degrades the output.
+# Invisible / zero-width characters that carry no readable value.
 _ARABIC_CLEANUP_MAP = str.maketrans({
     "\u200C": "",   # ZWNJ
     "\u200D": "",   # ZWJ
@@ -63,10 +69,45 @@ _ARABIC_CLEANUP_MAP = str.maketrans({
     "\uFEFF": "",   # BOM / ZWNBSP
 })
 
-_RE_REPEATED = re.compile(r"(.)\1{4,}")
+# Arabic punctuation → canonical Unicode equivalents frequently misread by OCR.
+_ARABIC_PUNCT_MAP = str.maketrans({
+    ",":  "\u060C",  # Western comma  → Arabic comma  ،
+    ";":  "\u061B",  # Western semi   → Arabic semi   ؛
+    "?":  "\u061F",  # Western ?      → Arabic ?      ؟
+})
 
-# Vertical band tolerance (px) for grouping boxes on the same text line (Arabic RTL sort).
+# Alef variants → bare Alef (U+0627).  Applied only when normalize_alef=True.
+_ALEF_VARIANTS = str.maketrans({
+    "\u0622": "\u0627",  # Alef with Madda  آ → ا
+    "\u0623": "\u0627",  # Alef with Hamza Above  أ → ا
+    "\u0625": "\u0627",  # Alef with Hamza Below  إ → ا
+    "\u0671": "\u0627",  # Alef Wasla  ٱ → ا
+})
+
+# Diacritic Unicode range U+064B–U+0652 (Fathatan … Sukun).
+_RE_DIACRITICS         = re.compile(r"[\u064B-\u0652]")
+# Kashida (tatweel) runs.
+_RE_KASHIDA            = re.compile(r"\u0640+")
+# Repeated diacritics (two or more identical diacritic codepoints in a row).
+_RE_REPEAT_DIACRITIC   = re.compile(r"([\u064B-\u0652])\1+")
+# Generic repeated character run of 5+ (noise detection).
+_RE_REPEATED           = re.compile(r"(.)\1{4,}")
+# Isolated single Arabic letter token (likely detection artefact).
+_RE_ISOLATED_AR_LETTER = re.compile(r"^[\u0600-\u06FF]$")
+
+# Arabic base-letter codepoint ranges used to count genuine word tokens.
+_ARABIC_BASE_RANGES = (
+    ("\u0600", "\u06FF"),  # Arabic block
+    ("\u0750", "\u077F"),  # Arabic Supplement
+    ("\uFB50", "\uFDFF"),  # Arabic Presentation Forms-A
+    ("\uFE70", "\uFEFF"),  # Arabic Presentation Forms-B
+)
+
+# Fallback band tolerance when bbox statistics are unavailable.
 _ARABIC_LINE_BAND_TOL_PX = 15
+
+# High-DPI threshold: if max(h, w) exceeds this, add a 0.75× downscale variant.
+_HIGHDPI_THRESHOLD_PX = 3000
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +146,20 @@ class PaddleOCRv4Model(BaseOCRModel):
         input_roi_warp: bool = False,
         roi_min_area_ratio: float = 0.15,
         roi_pad_ratio: float = 0.02,
+        # ---- Arabic-specific options ----
+        # Normalize all Alef variants (أ إ آ ٱ) to bare Alef (ا).
+        # Improves downstream search/NLP matching but loses orthographic detail.
+        # Leave False for archival / faithful transcription use-cases.
+        arabic_normalize_alef: bool = False,
+        # Legacy flag: previously applied python-bidi get_display() to “fix” order; that
+        # API maps logical→visual and scrambled Paddle output (already logical). Kept
+        # for config compatibility; has no effect on corrected text (see _to_logical_order).
+        arabic_normalize_bidi: bool = False,
+        # Filter isolated single-letter tokens that are almost always det artefacts.
+        arabic_filter_isolated_letters: bool = True,
+        # Mixed Arabic-English ratio threshold: pages above this fraction of
+        # non-Arabic chars are treated as mixed and get a relaxed scoring gate.
+        arabic_mixed_page_ratio_threshold: float = 0.35,
     ):
         self.use_gpu = use_gpu
         self.max_accuracy = max_accuracy
@@ -122,6 +177,11 @@ class PaddleOCRv4Model(BaseOCRModel):
         self.input_roi_warp = input_roi_warp
         self.roi_min_area_ratio = roi_min_area_ratio
         self.roi_pad_ratio = roi_pad_ratio
+        # Arabic-specific options
+        self.arabic_normalize_alef = arabic_normalize_alef
+        self.arabic_normalize_bidi = arabic_normalize_bidi
+        self.arabic_filter_isolated_letters = arabic_filter_isolated_letters
+        self.arabic_mixed_page_ratio_threshold = arabic_mixed_page_ratio_threshold
         # Primary full-pipeline engines (one per language)
         self._engines: dict[SupportedLanguage, object] = {}
         # F2: alternate-version full-pipeline engines per language
@@ -296,9 +356,75 @@ class PaddleOCRv4Model(BaseOCRModel):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _generate_page_variants(img_rgb: np.ndarray) -> list[tuple[str, float, np.ndarray]]:
+    def _estimate_skew_angle(gray: np.ndarray) -> float:
+        """
+        Estimate dominant text-line skew angle (degrees) via Hough on
+        a binarized image.  Returns 0.0 on failure so callers can safely
+        apply np.rot90(..., 0) i.e. no rotation.
+        Clamped to ±10° to avoid rotating legitimate rotated stamps/logos.
+        """
+        try:
+            _, binarized = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (30, 1))
+            dilated = cv2.dilate(binarized, kernel, iterations=1)
+            lines = cv2.HoughLinesP(
+                dilated, 1, np.pi / 180, threshold=80,
+                minLineLength=gray.shape[1] // 5, maxLineGap=20,
+            )
+            if lines is None or len(lines) == 0:
+                return 0.0
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if x2 != x1:
+                    angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+                    if abs(angle) <= 10:
+                        angles.append(angle)
+            if not angles:
+                return 0.0
+            return float(np.median(angles))
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _rotate_image(img_rgb: np.ndarray, angle_deg: float) -> np.ndarray:
+        """Rotate image by angle_deg around centre; fill with white."""
+        if abs(angle_deg) < 0.2:
+            return img_rgb
+        h, w = img_rgb.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        M = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+        cos_a = abs(M[0, 0])
+        sin_a = abs(M[0, 1])
+        new_w = int(h * sin_a + w * cos_a)
+        new_h = int(h * cos_a + w * sin_a)
+        M[0, 2] += (new_w / 2.0) - cx
+        M[1, 2] += (new_h / 2.0) - cy
+        rotated = cv2.warpAffine(
+            img_rgb, M, (new_w, new_h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255),
+        )
+        return rotated
+
+    def _generate_page_variants(
+        self,
+        img_rgb: np.ndarray,
+        language: SupportedLanguage = SupportedLanguage.ENGLISH,
+    ) -> list[tuple[str, float, np.ndarray]]:
         """
         Generate full-page preprocessing variants.
+
+        For Arabic, additional variants are produced:
+          - adaptive_thresh : Sauvola-style adaptive binarization — preserves
+            tashkeel thin strokes that CLAHE can smear.
+          - ink_bleed_clean  : morphological opening to suppress show-through
+            between lines (common in scanned/photocopied Arabic documents).
+          - deskewed         : Hough-based rotation correction (±10° clamp).
+          - downscaled_0.75x : Only for high-DPI inputs (max dim > 3000 px);
+            counteracts the 2× upscale benefit reversal on already-dense text.
+
         Returns list of (name, scale_factor, image_rgb).
         scale_factor is relative to the original (1.0 = same size, 2.0 = 2x).
         """
@@ -307,12 +433,15 @@ class PaddleOCRv4Model(BaseOCRModel):
         variants.append(("original", 1.0, img_rgb))
 
         h, w = img_rgb.shape[:2]
+
+        # Upscale — always generated; lightly penalised in scorer.
         up = cv2.resize(img_rgb, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
         variants.append(("upscaled_2x", 2.0, up))
 
         bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
+        # CLAHE — contrast enhancement, good for faded / low-contrast scans.
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         clahe_gray = clahe.apply(gray)
         variants.append((
@@ -320,12 +449,58 @@ class PaddleOCRv4Model(BaseOCRModel):
             cv2.cvtColor(cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
         ))
 
+        # Sharpened — unsharp mask kernel.
         sharpen_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
         sharpened = cv2.filter2D(bgr, -1, sharpen_k)
         variants.append(("sharpened", 1.0, cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)))
 
+        # Denoised — NL-means; helps low-quality camera captures.
         denoised = cv2.fastNlMeansDenoisingColored(bgr, None, 10, 10, 7, 21)
         variants.append(("denoised", 1.0, cv2.cvtColor(denoised, cv2.COLOR_BGR2RGB)))
+
+        # ------------------------------------------------------------------
+        # Arabic-specific variants (only added when language == ARABIC)
+        # ------------------------------------------------------------------
+        if language == SupportedLanguage.ARABIC:
+
+            # 1) Adaptive threshold — preserves diacritics (tashkeel) thin strokes
+            #    that CLAHE can smear.  Block size 11 px works well for 150–300 DPI.
+            adaptive = cv2.adaptiveThreshold(
+                gray, 255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                blockSize=11, C=6,
+            )
+            adaptive_rgb = cv2.cvtColor(
+                cv2.cvtColor(adaptive, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB
+            )
+            variants.append(("adaptive_thresh", 1.0, adaptive_rgb))
+
+            # 2) Ink-bleed removal — morphological opening with a 1-row horizontal
+            #    structuring element removes horizontal smear between lines while
+            #    preserving connected Arabic strokes.
+            ink_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 2))
+            ink_clean = cv2.morphologyEx(gray, cv2.MORPH_OPEN, ink_kernel, iterations=1)
+            ink_rgb = cv2.cvtColor(
+                cv2.cvtColor(ink_clean, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB
+            )
+            variants.append(("ink_bleed_clean", 1.0, ink_rgb))
+
+            # 3) Deskewed — correct small rotations from scanner/camera misalignment.
+            skew = self._estimate_skew_angle(gray)
+            if abs(skew) >= 0.2:
+                deskewed_rgb = self._rotate_image(img_rgb, -skew)
+                variants.append(("deskewed", 1.0, deskewed_rgb))
+                logger.debug("[PaddleOCR] Deskew applied: %.2f°", skew)
+
+            # 4) High-DPI downscale — large images cause the 2× upscale to be
+            #    counter-productive; a 0.75× pass gives a different receptive field.
+            if max(h, w) > _HIGHDPI_THRESHOLD_PX:
+                dw = int(w * 0.75)
+                dh = int(h * 0.75)
+                downscaled = cv2.resize(img_rgb, (dw, dh), interpolation=cv2.INTER_AREA)
+                variants.append(("downscaled_0.75x", 0.75, downscaled))
+                logger.debug("[PaddleOCR] High-DPI downscale variant added (%dx%d → %dx%d)", w, h, dw, dh)
 
         return variants
 
@@ -346,12 +521,11 @@ class PaddleOCRv4Model(BaseOCRModel):
         IoU alignment works across upscaled variants.
         Returns list of (variant_name, engine_name, parsed_page).
         """
-        variants = self._generate_page_variants(img_rgb)
-
         primary_engine = self._engines.get(lang_enum)
         if not primary_engine:
             return []
 
+        variants = self._generate_page_variants(img_rgb, language=lang_enum)
         engines: list[tuple[str, object]] = []
         if include_primary:
             primary_ver = LANG_CONFIG[lang_enum]["ocr_version"]
@@ -396,6 +570,7 @@ class PaddleOCRv4Model(BaseOCRModel):
 
     @staticmethod
     def _arabic_char_ratio(text: str) -> float:
+        """Fraction of characters in Arabic Unicode ranges."""
         if not text:
             return 0.0
         arabic = sum(
@@ -408,44 +583,144 @@ class PaddleOCRv4Model(BaseOCRModel):
         return arabic / len(text)
 
     @staticmethod
+    def _count_arabic_word_tokens(text: str) -> int:
+        """
+        Count genuine Arabic word tokens: whitespace-delimited tokens that
+        contain at least 2 base Arabic letters (U+0600–U+06FF, supplements,
+        presentation forms).  Single-codepoint tokens and pure-diacritic
+        clusters are excluded.
+
+        This avoids inflating scores on passes that consist mostly of isolated
+        diacritics or hallucinated single-character detections.
+        """
+        count = 0
+        for token in text.split():
+            base_letters = sum(
+                1 for c in token
+                if (
+                    ("\u0600" <= c <= "\u06FF" and c not in "\u064B\u064C\u064D\u064E\u064F\u0650\u0651\u0652\u0640")
+                    or "\u0750" <= c <= "\u077F"
+                    or "\uFB50" <= c <= "\uFDFF"
+                    or "\uFE70" <= c <= "\uFEFF"
+                )
+            )
+            if base_letters >= 2:
+                count += 1
+        return count
+
+    @staticmethod
+    def _diacritic_density(text: str) -> float:
+        """
+        Fraction of characters that are Arabic diacritics (U+064B–U+0652).
+        > 0.15 indicates heavy tashkeel (Quranic / classical text).
+        """
+        if not text:
+            return 0.0
+        diacritics = sum(1 for c in text if "\u064B" <= c <= "\u0652")
+        return diacritics / len(text)
+
+    @staticmethod
+    def _median_box_height(parsed: list[tuple[str, float, list[int]]]) -> float:
+        """
+        Compute median bounding-box height from a parsed page.
+        Used to derive a dynamic band tolerance for RTL line sorting.
+        Returns _ARABIC_LINE_BAND_TOL_PX if fewer than 3 boxes present.
+        """
+        if len(parsed) < 3:
+            return float(_ARABIC_LINE_BAND_TOL_PX)
+        heights = [float(bbox[3] - bbox[1]) for _, _, bbox in parsed if bbox[3] > bbox[1]]
+        if not heights:
+            return float(_ARABIC_LINE_BAND_TOL_PX)
+        return statistics.median(heights)
+
+    @staticmethod
+    def _detect_columns(
+        items: list,
+        bbox_extractor,
+        img_width: int = 0,
+        bimodal_gap_ratio: float = 0.10,
+    ) -> list[list]:
+        """
+        Detect whether bounding boxes are bimodally distributed along the
+        x-axis (two-column layout).  If so, partition items into right-column
+        and left-column lists.
+
+        ``bbox_extractor(item) -> [x1, y1, x2, y2]``
+
+        Returns a list of column groups ordered right → left (Arabic reading
+        order).  Returns [items] (single column) when no clear gap is found.
+        """
+        if len(items) < 6:
+            return [items]
+
+        centers_x = sorted(bbox_extractor(it)[0] + (bbox_extractor(it)[2] - bbox_extractor(it)[0]) / 2
+                            for it in items)
+        # Find the largest gap between consecutive x-centers.
+        gaps = [(centers_x[i + 1] - centers_x[i], i) for i in range(len(centers_x) - 1)]
+        max_gap, split_idx = max(gaps, key=lambda g: g[0])
+        page_width = img_width or max(bbox_extractor(it)[2] for it in items)
+        if page_width == 0 or max_gap / page_width < bimodal_gap_ratio:
+            return [items]
+
+        split_x = (centers_x[split_idx] + centers_x[split_idx + 1]) / 2
+        left_col  = [it for it in items if (bbox_extractor(it)[0] + bbox_extractor(it)[2]) / 2 <  split_x]
+        right_col = [it for it in items if (bbox_extractor(it)[0] + bbox_extractor(it)[2]) / 2 >= split_x]
+        # Arabic: right column first
+        return [right_col, left_col]
+
+    @classmethod
     def _sort_lines_reading_order(
+        cls,
         items: list[tuple[str, float, list[int]]],
         language: SupportedLanguage,
-        band_tol: int = _ARABIC_LINE_BAND_TOL_PX,
+        band_tol: int | None = None,
     ) -> list[tuple[str, float, list[int]]]:
         """
-        Reading order: English/Hindi — top-to-bottom by line (y).
-        Arabic — same vertical bands, then right-to-left within each band.
+        Reading order: English/Hindi — top-to-bottom, then left-to-right.
+        Arabic — column-aware RTL with dynamic band tolerance.
+
+        band_tol is computed dynamically as 40% of median box height when not
+        provided, falling back to _ARABIC_LINE_BAND_TOL_PX.
         """
         if not items:
             return []
         if language != SupportedLanguage.ARABIC:
             return sorted(items, key=lambda r: ((r[2][1] + r[2][3]) / 2, r[2][0]))
 
-        by_y = sorted(items, key=lambda r: (r[2][1] + r[2][3]) / 2)
-        bands: list[list[tuple[str, float, list[int]]]] = []
-        cur: list[tuple[str, float, list[int]]] = [by_y[0]]
-        ref_cy = (cur[0][2][1] + cur[0][2][3]) / 2
-        for it in by_y[1:]:
-            cy = (it[2][1] + it[2][3]) / 2
-            if abs(cy - ref_cy) < band_tol:
-                cur.append(it)
-            else:
-                bands.append(cur)
-                cur = [it]
-                ref_cy = cy
-        bands.append(cur)
+        tol = band_tol if band_tol is not None else max(
+            _ARABIC_LINE_BAND_TOL_PX,
+            int(cls._median_box_height(items) * 0.4),
+        )
 
+        def _bbox(it):
+            return it[2]
+
+        columns = cls._detect_columns(items, _bbox)
         out: list[tuple[str, float, list[int]]] = []
-        for band in bands:
-            out.extend(sorted(band, key=lambda r: r[2][0], reverse=True))
+        for col_items in columns:
+            by_y = sorted(col_items, key=lambda r: (r[2][1] + r[2][3]) / 2)
+            bands: list[list[tuple[str, float, list[int]]]] = []
+            cur: list[tuple[str, float, list[int]]] = [by_y[0]]
+            ref_cy = (cur[0][2][1] + cur[0][2][3]) / 2
+            for it in by_y[1:]:
+                cy = (it[2][1] + it[2][3]) / 2
+                if abs(cy - ref_cy) < tol:
+                    cur.append(it)
+                else:
+                    bands.append(cur)
+                    cur = [it]
+                    ref_cy = cy
+            bands.append(cur)
+            for band in bands:
+                out.extend(sorted(band, key=lambda r: r[2][0], reverse=True))
         return out
 
-    @staticmethod
+    @classmethod
     def _sort_f2_results_reading_order(
+        cls,
         results: list[tuple[str, str, float, list[int]]],
         language: SupportedLanguage,
-        band_tol: int = _ARABIC_LINE_BAND_TOL_PX,
+        band_tol: int | None = None,
     ) -> list[tuple[str, str, float, list[int]]]:
         """Same as _sort_lines_reading_order but for F2 (text_raw, text_corr, conf, bbox)."""
         if not results:
@@ -455,22 +730,35 @@ class PaddleOCRv4Model(BaseOCRModel):
                 results,
                 key=lambda r: ((r[3][1] + r[3][3]) / 2, r[3][0]),
             )
-        by_y = sorted(results, key=lambda r: (r[3][1] + r[3][3]) / 2)
-        bands: list[list[tuple[str, str, float, list[int]]]] = []
-        cur = [by_y[0]]
-        ref_cy = (cur[0][3][1] + cur[0][3][3]) / 2
-        for it in by_y[1:]:
-            cy = (it[3][1] + it[3][3]) / 2
-            if abs(cy - ref_cy) < band_tol:
-                cur.append(it)
-            else:
-                bands.append(cur)
-                cur = [it]
-                ref_cy = cy
-        bands.append(cur)
+
+        # Derive items compatible with _sort_lines_reading_order helper.
+        items_std = [(r[0], r[2], r[3]) for r in results]
+        tol = band_tol if band_tol is not None else max(
+            _ARABIC_LINE_BAND_TOL_PX,
+            int(cls._median_box_height(items_std) * 0.4),
+        )
+
+        def _bbox(it):
+            return it[3]
+
+        columns = cls._detect_columns(results, _bbox)
         out: list[tuple[str, str, float, list[int]]] = []
-        for band in bands:
-            out.extend(sorted(band, key=lambda r: r[3][0], reverse=True))
+        for col_items in columns:
+            by_y = sorted(col_items, key=lambda r: (r[3][1] + r[3][3]) / 2)
+            bands: list[list[tuple[str, str, float, list[int]]]] = []
+            cur = [by_y[0]]
+            ref_cy = (cur[0][3][1] + cur[0][3][3]) / 2
+            for it in by_y[1:]:
+                cy = (it[3][1] + it[3][3]) / 2
+                if abs(cy - ref_cy) < tol:
+                    cur.append(it)
+                else:
+                    bands.append(cur)
+                    cur = [it]
+                    ref_cy = cy
+            bands.append(cur)
+            for band in bands:
+                out.extend(sorted(band, key=lambda r: r[3][0], reverse=True))
         return out
 
     def _score_pass(
@@ -482,8 +770,20 @@ class PaddleOCRv4Model(BaseOCRModel):
         """
         Score an entire pass result.  Higher = better.
 
-        Uses sqrt(length) × mean_conf to reduce pure length bias (2× upscales
-        often add extra boxes). ``upscaled_2x`` gets a small extra penalty.
+        Arabic-aware improvements over the naive sqrt(len) × mean_conf formula:
+
+        1. Token count — uses genuine Arabic word tokens (≥2 base letters) rather
+           than raw character count, so isolated-diacritic passes do not win.
+        2. Ligature compensation — Arabic ligatures (ﷲ، لا، etc.) are single
+           codepoints representing 2-4 chars.  We multiply token count × 4.5
+           (avg chars/word) as a proxy for actual content length.
+        3. Mixed-page awareness — invoices and forms legitimately mix Arabic with
+           Latin/numerics.  When non-Arabic fraction exceeds the configured
+           threshold we use the looser ratio gate (0.10) instead of 0.30/0.50.
+        4. Diacritic-density gate — if a pass is >40% diacritics it is almost
+           certainly a detection fragmentation artefact; penalise heavily.
+        5. Bbox density check — if median box height < MIN_BOX_HEIGHT × 2 the
+           detector fired on noise rows rather than text lines.
         """
         if not parsed:
             return 0.0
@@ -492,23 +792,54 @@ class PaddleOCRv4Model(BaseOCRModel):
         if not total_text:
             return 0.0
 
-        total_len = len(total_text)
         mean_conf = sum(c for _, c, _ in parsed) / len(parsed)
 
-        score = math.sqrt(max(1.0, float(total_len))) * mean_conf
+        if language == SupportedLanguage.ARABIC:
+            # Use word-token count × proxy chars/token instead of raw char len.
+            token_count = self._count_arabic_word_tokens(total_text)
+            content_len = max(1.0, float(token_count) * 4.5)
+            score = math.sqrt(content_len) * mean_conf
 
+            # Diacritic density guard.
+            ddensity = self._diacritic_density(total_text)
+            if ddensity > 0.40:
+                score *= 0.3
+                logger.debug("[PaddleOCR F2] Diacritic-dense pass penalised (density=%.2f): %s", ddensity, variant_name)
+
+            # Bbox height density check.
+            med_h = self._median_box_height(parsed)
+            if med_h < self.MIN_BOX_HEIGHT * 2:
+                score *= 0.4
+                logger.debug("[PaddleOCR F2] Low median box height (%.1f px) penalised: %s", med_h, variant_name)
+
+            # Arabic ratio gating — mixed-page aware.
+            ar_ratio = self._arabic_char_ratio(total_text)
+            non_ar_ratio = 1.0 - ar_ratio
+            is_mixed_page = non_ar_ratio > self.arabic_mixed_page_ratio_threshold
+            if is_mixed_page:
+                # Looser gate for legitimate Arabic + Latin/numeric mixed content.
+                if ar_ratio < 0.10:
+                    score *= 0.2
+            else:
+                if ar_ratio < 0.30:
+                    score *= 0.2
+                elif ar_ratio < 0.50:
+                    score *= 0.5
+        else:
+            total_len = len(total_text)
+            score = math.sqrt(max(1.0, float(total_len))) * mean_conf
+
+        # Upscale penalty — applies to all languages.
         if variant_name == "upscaled_2x":
             score *= 0.88
 
+        # Downscale variant is also slightly penalised vs the original.
+        if variant_name == "downscaled_0.75x":
+            score *= 0.93
+
+        # Noise guard — repeated characters.
         if _RE_REPEATED.search(total_text):
             score *= 0.5
-
-        if language == SupportedLanguage.ARABIC:
-            ratio = self._arabic_char_ratio(total_text)
-            if ratio < 0.30:
-                score *= 0.2
-            elif ratio < 0.50:
-                score *= 0.5
 
         return score
 
@@ -543,41 +874,168 @@ class PaddleOCRv4Model(BaseOCRModel):
     ) -> tuple[bool, list[str]]:
         """
         Decide whether to run the optional PP-OCRv3 fallback.
-        Confidence alone is not used; we combine structure/coverage signals.
+
+        Combines five signal categories:
+          1. Coverage  — line count, total character count
+          2. Quality   — average confidence, Arabic ratio
+          3. Noise     — repeated character patterns
+          4. Density   — median bbox height (sub-pixel rows are noise, not text)
+          5. Structure — vertical IoU between adjacent boxes (diacritic
+             fragmentation where OCR splits a single line into many bbox pairs
+             that heavily overlap vertically)
         """
         reasons: list[str] = []
         if not parsed:
             return True, ["empty_primary_result"]
 
-        line_count = len(parsed)
-        total_text = " ".join(t.strip() for t, _, _ in parsed if t.strip())
+        line_count  = len(parsed)
+        total_text  = " ".join(t.strip() for t, _, _ in parsed if t.strip())
         total_chars = len(total_text)
-        avg_conf = sum(c for _, c, _ in parsed) / line_count if line_count else 0.0
-        ar_ratio = self._arabic_char_ratio(total_text) if total_text else 0.0
+        avg_conf    = sum(c for _, c, _ in parsed) / line_count if line_count else 0.0
+        ar_ratio    = self._arabic_char_ratio(total_text) if total_text else 0.0
 
+        # --- 1. Coverage checks ---
         if line_count < self.fallback_min_lines:
             reasons.append(f"low_line_count<{self.fallback_min_lines}")
         if total_chars < self.fallback_min_chars:
             reasons.append(f"low_char_count<{self.fallback_min_chars}")
+
+        # --- 2. Quality checks ---
         if avg_conf < self.fallback_min_avg_conf:
             reasons.append(f"low_avg_conf<{self.fallback_min_avg_conf:.2f}")
         if ar_ratio < self.fallback_min_ar_ratio:
             reasons.append(f"low_arabic_ratio<{self.fallback_min_ar_ratio:.2f}")
+
+        # --- 3. Noise guard ---
         if _RE_REPEATED.search(total_text):
             reasons.append("repeated_char_pattern")
+
+        # --- 4. Bbox height density ---
+        med_h = self._median_box_height(parsed)
+        if med_h < self.MIN_BOX_HEIGHT * 2:
+            reasons.append(f"low_median_box_height<{self.MIN_BOX_HEIGHT * 2}px(got {med_h:.1f}px)")
+
+        # --- 5. Vertical IoU fragmentation ---
+        # Sort boxes by top-y and check consecutive pairs for heavy vertical overlap.
+        # >20% of adjacent pairs overlapping by >30% of the shorter box height
+        # indicates the detector fragmented lines rather than detecting them whole.
+        if line_count >= 4:
+            sorted_boxes = sorted(parsed, key=lambda r: r[2][1])
+            overlap_pairs = 0
+            for i in range(len(sorted_boxes) - 1):
+                _, _, b1 = sorted_boxes[i]
+                _, _, b2 = sorted_boxes[i + 1]
+                # Vertical intersection
+                inter_top    = max(b1[1], b2[1])
+                inter_bottom = min(b1[3], b2[3])
+                if inter_bottom <= inter_top:
+                    continue
+                inter_h = inter_bottom - inter_top
+                min_h   = min(b1[3] - b1[1], b2[3] - b2[1])
+                if min_h > 0 and inter_h / min_h > 0.30:
+                    overlap_pairs += 1
+            overlap_ratio = overlap_pairs / (line_count - 1)
+            if overlap_ratio > 0.20:
+                reasons.append(
+                    f"bbox_vertical_overlap_fragmentation({overlap_pairs}/{line_count - 1}pairs)"
+                )
 
         return (len(reasons) > 0), reasons
 
     # ------------------------------------------------------------------
-    # Stage 5 — Arabic language-model correction
+    # Stage 5 — Arabic text correction pipeline
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _arabic_correct(text: str) -> str:
+    def _to_logical_order(text: str) -> str:
+        """
+        Return Arabic text unchanged.
+
+        PaddleOCR Arabic recognition already emits Unicode *logical* order (typing
+        order).  ``bidi.algorithm.get_display()`` does the opposite — it builds a
+        *visual* string for LTR display — and was incorrectly used here, which
+        reversed or mangled ``primary_response_corrected_text`` relative to raw OCR.
+
+        True visual→logical repair would need a dedicated algorithm; until then,
+        API consumers should use the corrected string as-is.  For *drawing* on an
+        LTR canvas, use reshape + get_display in the visualization path only
+        (see ``_pil_draw_arabic``), not in stored OCR results.
+        """
+        return text
+
+    def _arabic_correct(self, text: str) -> str:
+        """
+        Full Arabic post-OCR correction pipeline applied in Stage 5.
+
+        Steps (in order):
+          1. NFC normalization  — canonical decomposition + canonical composition.
+          2. Invisible char removal — ZWNJ, ZWJ, zero-width space, LRM, RLM, BOM.
+          3. NFKC normalization  — resolves Arabic Presentation Forms (ﻛ → ك).
+          4. Kashida (tatweel) removal — OCR hallucinates U+0640 runs; strip them.
+          5. Repeated diacritic deduplication — e.g. ً ً → ً.
+          6. Punctuation normalization — Western , ; ? → Arabic ، ؛ ؟.
+          7. Alef normalization (opt-in) — أ إ آ ٱ → ا; useful for search/NLP
+             but loses orthographic fidelity; off by default.
+          8. Isolated single-letter token filtering (opt-in) — standalone Arabic
+             letters surrounded by whitespace are almost always detector artefacts.
+          9. BiDi hook (legacy, no-op) — ``arabic_normalize_bidi`` is retained for
+             compatibility; see ``_to_logical_order``.
+        """
+        if not text or not text.strip():
+            return text
+
+        # 1. NFC
         text = unicodedata.normalize("NFC", text)
+
+        # 2. Invisible chars
         text = text.translate(_ARABIC_CLEANUP_MAP)
-        # Presentation forms (e.g. ﻛ → ك) — normalize after NFC per Unicode guidance
+
+        # 3. NFKC — resolves presentation forms (ﻛ → ك, ﷲ stays as is)
         text = unicodedata.normalize("NFKC", text)
+
+        # 4. Kashida removal — strip all tatweel runs.
+        text = _RE_KASHIDA.sub("", text)
+
+        # 5. Repeated diacritic deduplication.
+        text = _RE_REPEAT_DIACRITIC.sub(r"\1", text)
+
+        # 6. Punctuation normalization: Western → Arabic.
+        #    Only replace when the character is adjacent to Arabic context to
+        #    avoid corrupting embedded URLs or code snippets.
+        _PUNCT_REPL = {",": "\u060C", ";": "\u061B", "?": "\u061F"}
+        chars = list(text)
+        for idx, ch in enumerate(chars):
+            if ch in _PUNCT_REPL:
+                prev_ar = idx > 0 and any(
+                    lo <= chars[idx - 1] <= hi for lo, hi in _ARABIC_BASE_RANGES
+                )
+                next_ar = idx < len(chars) - 1 and any(
+                    lo <= chars[idx + 1] <= hi for lo, hi in _ARABIC_BASE_RANGES
+                )
+                if prev_ar or next_ar:
+                    chars[idx] = _PUNCT_REPL[ch]
+        text = "".join(chars)
+
+        # 7. Alef normalization (opt-in).
+        if self.arabic_normalize_alef:
+            text = text.translate(_ALEF_VARIANTS)
+
+        # 8. Isolated single-letter filtering (opt-in).
+        if self.arabic_filter_isolated_letters:
+            tokens = text.split()
+            filtered = [
+                tok for tok in tokens
+                if not _RE_ISOLATED_AR_LETTER.match(tok)
+            ]
+            # Only apply if filtering removed ≤20% of tokens to avoid destroying
+            # legitimate single-letter tokens (e.g. Arabic conjunctions ف، و، ب).
+            if tokens and len(filtered) / len(tokens) >= 0.80:
+                text = " ".join(filtered)
+
+        # 9. BiDi logical-order normalization (opt-in).
+        if self.arabic_normalize_bidi:
+            text = self._to_logical_order(text)
+
         return text.strip()
 
     # ------------------------------------------------------------------
@@ -834,7 +1292,7 @@ class PaddleOCRv4Model(BaseOCRModel):
         debug_paths: dict[str, str] = {}
         if self.debug_output_dir and debug_run_id:
             try:
-                variants = self._generate_page_variants(img_rgb)
+                variants = self._generate_page_variants(img_rgb, language=lang_enum)
                 debug_paths = self._visualize_f2(img_rgb, variants, results, debug_run_id)
             except Exception as exc:
                 logger.warning("[PaddleOCR F2 VIS] Visualisation failed: %s", exc)
@@ -1001,6 +1459,34 @@ class PaddleOCRv4Model(BaseOCRModel):
             if language == SupportedLanguage.ALL:
                 metadata["best_effort_language_mode"] = "best_single_language_engine_per_page"
                 metadata["resolved_page_languages"]   = resolved_page_languages
+            if language == SupportedLanguage.ARABIC:
+                # Expose Arabic pipeline configuration for downstream consumers.
+                metadata["arabic_pipeline"] = {
+                    "normalize_alef":            self.arabic_normalize_alef,
+                    "normalize_bidi":            self.arabic_normalize_bidi,
+                    "filter_isolated_letters":   self.arabic_filter_isolated_letters,
+                    "mixed_page_ratio_threshold": self.arabic_mixed_page_ratio_threshold,
+                }
+                # Lightweight document-type signal: diacritic density on the
+                # full output text.  Informs downstream whether confidence
+                # estimates may be systematically lower than normal.
+                if raw_text:
+                    ddensity = self._diacritic_density(raw_text)
+                    if ddensity > 0.15:
+                        doc_type = "quranic_or_classical"
+                    elif ddensity > 0.05:
+                        doc_type = "partially_diacritized"
+                    else:
+                        doc_type = "modern_printed"
+                    metadata["arabic_doc_type"]         = doc_type
+                    metadata["arabic_diacritic_density"] = round(ddensity, 4)
+                    if doc_type == "quranic_or_classical":
+                        logger.info(
+                            "[PaddleOCR] Arabic doc type: %s (diacritic density=%.3f) "
+                            "— confidence scores may be suppressed; consider lowering "
+                            "text_rec_score_thresh for this document class.",
+                            doc_type, ddensity,
+                        )
 
             return OCRResult(
                 model_name=self.name,
