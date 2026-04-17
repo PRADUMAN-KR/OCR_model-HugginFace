@@ -64,6 +64,15 @@ class ModelRegistry:
 
             return PaddleOCRv4Model(
                 use_gpu=settings.PADDLE_USE_GPU,
+                max_accuracy=settings.PADDLE_MAX_ACCURACY,
+                paddle_mem_fraction=settings.PADDLE_MEM_FRACTION,
+                paddle_allocator_strategy=settings.PADDLE_FLAGS_ALLOCATOR_STRATEGY,
+                paddle_gpu_memory_fraction=settings.PADDLE_FLAGS_FRACTION_OF_GPU_MEMORY_TO_USE,
+                empty_cache_between_pages=settings.PADDLE_EMPTY_CACHE_BETWEEN_PAGES,
+                det_limit_side_len=settings.PADDLE_DET_LIMIT_SIDE_LEN,
+                precision=settings.PADDLE_PRECISION,
+                enable_fp16=settings.PADDLE_FP16,
+                use_tensorrt=settings.PADDLE_TENSORRT,
                 debug_output_dir=settings.PADDLE_DEBUG_OUTPUT_DIR or None,
                 enable_arabic_v3_fallback=settings.PADDLE_ARABIC_V3_FALLBACK,
                 always_run_both_arabic_engines=settings.PADDLE_ARABIC_RUN_BOTH_ENGINES,

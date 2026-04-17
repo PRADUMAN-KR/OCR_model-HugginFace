@@ -3,7 +3,7 @@ PaddleOCR PP-OCRv4/v5 — Tier 2
 
 Standard pipeline + F2 MAX-ACCURACY pipeline (enabled when max_accuracy=True):
 
-  Stage 1 — Full-page variants (original, 2x, CLAHE, sharpened, denoised,
+  Stage 1 — Full-page variants (original, 2x, CLAHE,
              + Arabic-specific: adaptive_thresh, ink_bleed, deskewed,
                downscaled_0.75x [for high-DPI inputs])
   Stage 2 — Run full engine.ocr() on each variant × each engine
@@ -22,6 +22,7 @@ Install:  pip install paddlepaddle paddleocr opencv-python python-bidi arabic-re
 
 import logging
 import math
+import os
 import re
 import statistics
 import unicodedata
@@ -146,6 +147,14 @@ class PaddleOCRv4Model(BaseOCRModel):
         input_roi_warp: bool = False,
         roi_min_area_ratio: float = 0.15,
         roi_pad_ratio: float = 0.02,
+        paddle_mem_fraction: float | None = None,
+        paddle_allocator_strategy: str | None = None,
+        paddle_gpu_memory_fraction: float | None = None,
+        empty_cache_between_pages: bool = False,
+        det_limit_side_len: int | None = None,
+        precision: str = "fp32",
+        enable_fp16: bool = False,
+        use_tensorrt: bool = False,
         # ---- Arabic-specific options ----
         # Normalize all Alef variants (أ إ آ ٱ) to bare Alef (ا).
         # Improves downstream search/NLP matching but loses orthographic detail.
@@ -177,6 +186,22 @@ class PaddleOCRv4Model(BaseOCRModel):
         self.input_roi_warp = input_roi_warp
         self.roi_min_area_ratio = roi_min_area_ratio
         self.roi_pad_ratio = roi_pad_ratio
+        self.paddle_mem_fraction = paddle_mem_fraction
+        self.paddle_allocator_strategy = paddle_allocator_strategy
+        self.paddle_gpu_memory_fraction = paddle_gpu_memory_fraction
+        self.empty_cache_between_pages = empty_cache_between_pages
+        self.det_limit_side_len = det_limit_side_len
+        requested_precision = (precision or "fp32").strip().lower()
+        if requested_precision not in {"fp32", "fp16", "bf16"}:
+            logger.warning(
+                "[PaddleOCR] Unsupported precision=%s requested; falling back to fp32",
+                precision,
+            )
+            requested_precision = "fp32"
+        if enable_fp16 and requested_precision == "fp32":
+            requested_precision = "fp16"
+        self.precision = requested_precision
+        self.use_tensorrt = bool(use_tensorrt)
         # Arabic-specific options
         self.arabic_normalize_alef = arabic_normalize_alef
         self.arabic_normalize_bidi = arabic_normalize_bidi
@@ -186,6 +211,8 @@ class PaddleOCRv4Model(BaseOCRModel):
         self._engines: dict[SupportedLanguage, object] = {}
         # F2: alternate-version full-pipeline engines per language
         self._alt_engines: dict[SupportedLanguage, list[tuple[str, object]]] = {}
+        self._paddleocr_cls = None
+        self._device = "cpu"
 
     def supports_all_languages(self) -> bool:
         return True
@@ -195,70 +222,203 @@ class PaddleOCRv4Model(BaseOCRModel):
     # ------------------------------------------------------------------
 
     async def load(self) -> None:
+        if self.paddle_allocator_strategy:
+            os.environ["FLAGS_allocator_strategy"] = self.paddle_allocator_strategy
+        if self.paddle_gpu_memory_fraction is not None:
+            os.environ["FLAGS_fraction_of_gpu_memory_to_use"] = str(self.paddle_gpu_memory_fraction)
+
         from paddleocr import PaddleOCR
 
-        device = "gpu" if self.use_gpu else "cpu"
-        logger.info("[PaddleOCR] Device: %s | max_accuracy(F2): %s", device.upper(), self.max_accuracy)
-
-        for lang_enum, config in LANG_CONFIG.items():
-            paddle_lang = config["lang"]
-            ocr_version = config["ocr_version"]
-            logger.info("[PaddleOCR] Loading engine: lang=%s version=%s", paddle_lang, ocr_version)
-            self._engines[lang_enum] = PaddleOCR(
-                use_textline_orientation=True,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                lang=paddle_lang,
-                device=device,
-                ocr_version=ocr_version,
-                text_det_thresh=0.5,
-                text_det_box_thresh=0.7,
-                text_rec_score_thresh=0.5,
-            )
-
-            if not self.max_accuracy:
-                continue
-
-            # Load alternate-version engines only when a mode needs them.
-            if not (self.enable_arabic_v3_fallback or self.always_run_both_arabic_engines):
-                continue
-
-            # Load alternate-version engines for fallback.
-            alt_list: list[tuple[str, object]] = []
-            for alt_ver in _ALT_ENGINES.get(lang_enum, []):
-                try:
-                    logger.info("[PaddleOCR F2] Loading alt engine: lang=%s version=%s", paddle_lang, alt_ver)
-                    alt_engine = PaddleOCR(
-                        use_textline_orientation=True,
-                        use_doc_orientation_classify=False,
-                        use_doc_unwarping=False,
-                        lang=paddle_lang,
-                        device=device,
-                        ocr_version=alt_ver,
-                        text_det_thresh=0.5,
-                        text_det_box_thresh=0.7,
-                        text_rec_score_thresh=0.5,
-                    )
-                    alt_list.append((alt_ver, alt_engine))
-                except Exception as exc:
-                    logger.warning("[PaddleOCR F2] Alt engine %s unavailable for %s: %s", alt_ver, paddle_lang, exc)
-
-            if alt_list:
-                self._alt_engines[lang_enum] = alt_list
-                logger.info(
-                    "[PaddleOCR F2] %d alt engine(s) for %s: %s",
-                    len(alt_list), paddle_lang, [v for v, _ in alt_list],
-                )
-
-        n_engines = 1 + len(self._alt_engines.get(SupportedLanguage.ARABIC, []))
+        self._paddleocr_cls = PaddleOCR
+        self._device = "gpu" if self.use_gpu else "cpu"
         logger.info(
-            "[PaddleOCR] All engines loaded. F2 passes/variant: %d | ar_v3_fallback=%s | ar_run_both=%s",
-            n_engines, self.enable_arabic_v3_fallback, self.always_run_both_arabic_engines,
+            "[PaddleOCR] Device: %s | max_accuracy(F2): %s | precision=%s | TensorRT=%s | mem_fraction=%s | flags_allocator=%s | flags_gpu_fraction=%s | load_mode=lazy",
+            self._device.upper(),
+            self.max_accuracy,
+            self.precision,
+            self.use_tensorrt,
+            self.paddle_mem_fraction if self.paddle_mem_fraction is not None else "default",
+            self.paddle_allocator_strategy if self.paddle_allocator_strategy else "default",
+            self.paddle_gpu_memory_fraction if self.paddle_gpu_memory_fraction is not None else "default",
         )
 
     async def unload(self) -> None:
         self._engines.clear()
         self._alt_engines.clear()
+        self._paddleocr_cls = None
+
+    def _build_engine(self, paddle_lang: str, ocr_version: str) -> object:
+        if self._paddleocr_cls is None:
+            raise RuntimeError("PaddleOCR class is not initialized. Call load() first.")
+
+        requested_precision = self.precision if self.use_gpu else "fp32"
+        requested_tensorrt = bool(self.use_gpu and self.use_tensorrt)
+        kwargs = {
+            "use_textline_orientation": True,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "lang": paddle_lang,
+            "device": self._device,
+            "ocr_version": ocr_version,
+            "text_det_thresh": 0.5,
+            "text_det_box_thresh": 0.7,
+            "text_rec_score_thresh": 0.5,
+        }
+        if self.use_gpu:
+            if self.precision != "fp32":
+                kwargs["precision"] = self.precision
+            if self.use_tensorrt:
+                kwargs["use_tensorrt"] = True
+        if self.paddle_mem_fraction is not None:
+            kwargs["paddle_mem_fraction"] = self.paddle_mem_fraction
+        if self.det_limit_side_len is not None:
+            kwargs["det_limit_side_len"] = self.det_limit_side_len
+            # Paddle's resize logging ("max_side_limit") is typically driven by
+            # `limit_side_len`, so set it as well to ensure the cap applies.
+            kwargs["limit_side_len"] = self.det_limit_side_len
+
+        try:
+            logger.info(
+                "[PaddleOCR] Engine kwargs: lang=%s ocr_version=%s precision=%s use_tensorrt=%s det_limit_side_len=%s limit_side_len=%s",
+                paddle_lang,
+                ocr_version,
+                kwargs.get("precision", "fp32"),
+                kwargs.get("use_tensorrt", False),
+                kwargs.get("det_limit_side_len"),
+                kwargs.get("limit_side_len"),
+            )
+            engine = self._paddleocr_cls(**kwargs)
+            logger.info(
+                "[PaddleOCR] Engine active: lang=%s ocr_version=%s device=%s requested_precision=%s applied_precision=%s requested_tensorrt=%s applied_tensorrt=%s",
+                paddle_lang,
+                ocr_version,
+                self._device,
+                requested_precision,
+                kwargs.get("precision", "fp32"),
+                requested_tensorrt,
+                kwargs.get("use_tensorrt", False),
+            )
+            return engine
+        except (TypeError, ValueError, ModuleNotFoundError) as exc:
+            msg = str(exc)
+            retried = False
+
+            if "paddle_mem_fraction" in kwargs and "paddle_mem_fraction" in msg:
+                logger.warning(
+                    "[PaddleOCR] paddle_mem_fraction unsupported by current PaddleOCR build; falling back: %s",
+                    exc,
+                )
+                kwargs.pop("paddle_mem_fraction", None)
+                retried = True
+
+            if "precision" in kwargs and "precision" in msg:
+                logger.warning(
+                    "[PaddleOCR] precision=%s unsupported by current PaddleOCR build; falling back to fp32: %s",
+                    kwargs.get("precision"),
+                    exc,
+                )
+                kwargs.pop("precision", None)
+                retried = True
+
+            if "use_tensorrt" in kwargs and "use_tensorrt" in msg:
+                logger.warning(
+                    "[PaddleOCR] use_tensorrt unsupported by current PaddleOCR build; disabling TensorRT: %s",
+                    exc,
+                )
+                kwargs.pop("use_tensorrt", None)
+                retried = True
+
+            if "use_tensorrt" in kwargs and isinstance(exc, ModuleNotFoundError) and "tensorrt" in msg.lower():
+                logger.warning(
+                    "[PaddleOCR] TensorRT requested but Python package 'tensorrt' is not installed; disabling TensorRT and continuing: %s",
+                    exc,
+                )
+                kwargs.pop("use_tensorrt", None)
+                retried = True
+
+            if (
+                "det_limit_side_len" in kwargs
+                and "det_limit_side_len" in msg
+                and self.det_limit_side_len is not None
+            ):
+                # Some PaddleOCR builds only support `limit_side_len` (applies globally).
+                kwargs.pop("det_limit_side_len", None)
+                if "limit_side_len" not in kwargs:
+                    kwargs["limit_side_len"] = self.det_limit_side_len
+                retried = True
+
+            if "limit_side_len" in kwargs and "limit_side_len" in msg:
+                kwargs.pop("limit_side_len", None)
+                retried = True
+
+            if retried:
+                engine = self._paddleocr_cls(**kwargs)
+                logger.info(
+                    "[PaddleOCR] Engine active after fallback: lang=%s ocr_version=%s device=%s requested_precision=%s applied_precision=%s requested_tensorrt=%s applied_tensorrt=%s",
+                    paddle_lang,
+                    ocr_version,
+                    self._device,
+                    requested_precision,
+                    kwargs.get("precision", "fp32"),
+                    requested_tensorrt,
+                    kwargs.get("use_tensorrt", False),
+                )
+                return engine
+            raise
+
+    def _get_or_load_primary_engine(self, lang_enum: SupportedLanguage):
+        engine = self._engines.get(lang_enum)
+        if engine is not None:
+            return engine
+
+        config = LANG_CONFIG.get(lang_enum)
+        if not config:
+            return None
+
+        paddle_lang = config["lang"]
+        ocr_version = config["ocr_version"]
+        logger.info("[PaddleOCR] Lazy-loading engine: lang=%s version=%s", paddle_lang, ocr_version)
+        engine = self._build_engine(paddle_lang, ocr_version)
+        self._engines[lang_enum] = engine
+        return engine
+
+    def _get_or_load_alt_engines(self, lang_enum: SupportedLanguage) -> list[tuple[str, object]]:
+        loaded = self._alt_engines.get(lang_enum)
+        if loaded is not None:
+            return loaded
+
+        config = LANG_CONFIG.get(lang_enum)
+        if not config:
+            self._alt_engines[lang_enum] = []
+            return []
+
+        paddle_lang = config["lang"]
+        alt_list: list[tuple[str, object]] = []
+        for alt_ver in _ALT_ENGINES.get(lang_enum, []):
+            try:
+                logger.info("[PaddleOCR F2] Lazy-loading alt engine: lang=%s version=%s", paddle_lang, alt_ver)
+                alt_engine = self._build_engine(paddle_lang, alt_ver)
+                alt_list.append((alt_ver, alt_engine))
+            except Exception as exc:
+                logger.warning("[PaddleOCR F2] Alt engine %s unavailable for %s: %s", alt_ver, paddle_lang, exc)
+
+        self._alt_engines[lang_enum] = alt_list
+        if alt_list:
+            logger.info(
+                "[PaddleOCR F2] %d alt engine(s) for %s: %s",
+                len(alt_list), paddle_lang, [v for v, _ in alt_list],
+            )
+        return alt_list
+
+    def _maybe_empty_gpu_cache(self, page_idx: int) -> None:
+        if not (self.use_gpu and self.empty_cache_between_pages):
+            return
+        try:
+            import paddle
+
+            paddle.device.cuda.empty_cache()
+        except Exception as exc:
+            logger.debug("[PaddleOCR] GPU cache clear skipped on page %d: %s", page_idx, exc)
 
     # ------------------------------------------------------------------
     # Input pipeline — document ROI (before detection)
@@ -449,15 +609,6 @@ class PaddleOCRv4Model(BaseOCRModel):
             cv2.cvtColor(cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB),
         ))
 
-        # Sharpened — unsharp mask kernel.
-        sharpen_k = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-        sharpened = cv2.filter2D(bgr, -1, sharpen_k)
-        variants.append(("sharpened", 1.0, cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)))
-
-        # Denoised — NL-means; helps low-quality camera captures.
-        denoised = cv2.fastNlMeansDenoisingColored(bgr, None, 10, 10, 7, 21)
-        variants.append(("denoised", 1.0, cv2.cvtColor(denoised, cv2.COLOR_BGR2RGB)))
-
         # ------------------------------------------------------------------
         # Arabic-specific variants (only added when language == ARABIC)
         # ------------------------------------------------------------------
@@ -521,7 +672,7 @@ class PaddleOCRv4Model(BaseOCRModel):
         IoU alignment works across upscaled variants.
         Returns list of (variant_name, engine_name, parsed_page).
         """
-        primary_engine = self._engines.get(lang_enum)
+        primary_engine = self._get_or_load_primary_engine(lang_enum)
         if not primary_engine:
             return []
 
@@ -531,19 +682,46 @@ class PaddleOCRv4Model(BaseOCRModel):
             primary_ver = LANG_CONFIG[lang_enum]["ocr_version"]
             engines.append((primary_ver, primary_engine))
         if include_alt:
-            engines.extend(self._alt_engines.get(lang_enum, []))
+            engines.extend(self._get_or_load_alt_engines(lang_enum))
         if not engines:
             return []
 
         all_passes: list[tuple[str, str, list[tuple[str, float, list[int]]]]] = []
 
         for variant_name, scale, variant_img in variants:
+            # Hard-cap very large inputs to control VRAM.
+            # PaddleOCR has internal side-length logic, but relying on it can be
+            # brittle across versions; this keeps bbox normalization correct.
+            effective_scale = float(scale)
+            variant_for_engine = variant_img
+            if self.det_limit_side_len is not None:
+                vh, vw = variant_for_engine.shape[:2]
+                max_side = max(vh, vw)
+                if max_side > self.det_limit_side_len:
+                    down_scale = self.det_limit_side_len / float(max_side)
+                    new_w = max(1, int(vw * down_scale))
+                    new_h = max(1, int(vh * down_scale))
+                    variant_for_engine = cv2.resize(
+                        variant_for_engine,
+                        (new_w, new_h),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    effective_scale = float(scale) * down_scale
+                    logger.debug(
+                        "[PaddleOCR F2] Downscaled variant=%s from %dx%d to %dx%d (effective_scale=%.4f)",
+                        variant_name,
+                        vw,
+                        vh,
+                        new_w,
+                        new_h,
+                        effective_scale,
+                    )
             for engine_name, engine in engines:
                 try:
-                    result = engine.ocr(variant_img)
+                    result = engine.ocr(variant_for_engine)
                     parsed = self._parse_ocr_page(result[0]) if result and result[0] else []
-                    if scale != 1.0 and parsed:
-                        inv = 1.0 / scale
+                    if effective_scale != 1.0 and parsed:
+                        inv = 1.0 / effective_scale
                         parsed = [
                             (text, conf, [
                                 int(bbox[0] * inv), int(bbox[1] * inv),
@@ -1204,7 +1382,11 @@ class PaddleOCRv4Model(BaseOCRModel):
         # Optional Arabic v3 execution modes:
         # 1) always_run_both_arabic_engines=True  -> always compare v5 vs v3
         # 2) enable_arabic_v3_fallback=True       -> run v3 only on weak v5 signal
-        if lang_enum == SupportedLanguage.ARABIC and self._alt_engines.get(lang_enum):
+        alt_engines_available = (
+            bool(_ALT_ENGINES.get(lang_enum))
+            and (self.enable_arabic_v3_fallback or self.always_run_both_arabic_engines)
+        )
+        if lang_enum == SupportedLanguage.ARABIC and alt_engines_available:
             should_run_alt = False
             reasons: list[str] = []
             if self.always_run_both_arabic_engines:
@@ -1303,6 +1485,39 @@ class PaddleOCRv4Model(BaseOCRModel):
     # Shared helpers
     # ------------------------------------------------------------------
 
+    def _cap_image_side_len(
+        self, img_rgb: np.ndarray
+    ) -> tuple[np.ndarray, float]:
+        """
+        Pre-resize *img_rgb* so that its longest side does not exceed
+        ``self.det_limit_side_len``.
+
+        This is necessary because PP-OCRv5 uses PaddleX internally, which
+        applies its own ``max_side_limit`` cap (default 4000 px) **before**
+        the ``det_limit_side_len`` resize step.  By resizing here we ensure
+        the image never reaches that internal cap and the log message
+        "Resized image size … exceeds max_side_limit of 4000" is suppressed.
+
+        Returns ``(resized_image, scale_factor)`` where ``scale_factor < 1``
+        when a resize was applied, or ``(img_rgb, 1.0)`` when the image
+        already fits within the limit.
+        """
+        if self.det_limit_side_len is None:
+            return img_rgb, 1.0
+        h, w = img_rgb.shape[:2]
+        max_side = max(h, w)
+        if max_side <= self.det_limit_side_len:
+            return img_rgb, 1.0
+        scale = self.det_limit_side_len / float(max_side)
+        new_w = max(1, int(w * scale))
+        new_h = max(1, int(h * scale))
+        resized = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        logger.debug(
+            "[PaddleOCR] Pre-resized image %dx%d → %dx%d (det_limit_side_len=%d)",
+            w, h, new_w, new_h, self.det_limit_side_len,
+        )
+        return resized, scale
+
     @staticmethod
     def _to_xyxy_bbox(poly) -> list[int]:
         if poly is None:
@@ -1353,15 +1568,31 @@ class PaddleOCRv4Model(BaseOCRModel):
     def _select_all_language_page(
         self, img_array: np.ndarray
     ) -> tuple[SupportedLanguage | None, list[tuple[str, float, list[int]]], float]:
+        # Pre-resize before passing to any engine so PaddleX's internal
+        # max_side_limit (4000 px) is never triggered.
+        capped_img, cap_scale = self._cap_image_side_len(img_array)
         best_lang: SupportedLanguage | None = None
         best_page: list[tuple[str, float, list[int]]] = []
         best_score = -1.0
         total_elapsed = 0.0
-        for lang_enum, engine in self._engines.items():
+        for lang_enum in LANG_CONFIG:
+            engine = self._get_or_load_primary_engine(lang_enum)
+            if not engine:
+                continue
             t0 = self._timer()
-            result = engine.ocr(img_array)
+            result = engine.ocr(capped_img)
             total_elapsed += self._elapsed_ms(t0)
             parsed = self._parse_ocr_page(result[0]) if result and result[0] else []
+            # Scale bboxes back to original image coordinates.
+            if cap_scale != 1.0 and parsed:
+                inv = 1.0 / cap_scale
+                parsed = [
+                    (text, conf, [
+                        int(bbox[0] * inv), int(bbox[1] * inv),
+                        int(bbox[2] * inv), int(bbox[3] * inv),
+                    ])
+                    for text, conf, bbox in parsed
+                ]
             score = self._page_score(parsed)
             if score > best_score:
                 best_score, best_lang, best_page = score, lang_enum, parsed
@@ -1373,7 +1604,7 @@ class PaddleOCRv4Model(BaseOCRModel):
 
     async def run(self, image_bytes: bytes, language: SupportedLanguage) -> OCRResult:
         if language != SupportedLanguage.ALL:
-            engine = self._engines.get(language)
+            engine = self._get_or_load_primary_engine(language)
             if not engine:
                 return OCRResult.from_error(self.name, language.value, f"Language {language} not loaded")
         else:
@@ -1428,10 +1659,23 @@ class PaddleOCRv4Model(BaseOCRModel):
                         lines_raw.append(text_raw)
 
                 else:
+                    # Pre-resize so PaddleX's internal max_side_limit (4000 px)
+                    # is never triggered when det_limit_side_len is set.
+                    capped_img, cap_scale = self._cap_image_side_len(img_array)
                     t0 = self._timer()
-                    result = engine.ocr(img_array)  # type: ignore[union-attr]
+                    result = engine.ocr(capped_img)  # type: ignore[union-attr]
                     total_elapsed += self._elapsed_ms(t0)
                     parsed_std = self._parse_ocr_page(result[0]) if result and result[0] else []
+                    # Scale bboxes back to original image coordinates.
+                    if cap_scale != 1.0 and parsed_std:
+                        inv = 1.0 / cap_scale
+                        parsed_std = [
+                            (text, conf, [
+                                int(bbox[0] * inv), int(bbox[1] * inv),
+                                int(bbox[2] * inv), int(bbox[3] * inv),
+                            ])
+                            for text, conf, bbox in parsed_std
+                        ]
                     lines, lines_raw = [], []
                     for text, conf, flat_bbox in parsed_std:
                         words.append(OCRWord(text=text, confidence=conf, bbox=flat_bbox))
@@ -1440,6 +1684,7 @@ class PaddleOCRv4Model(BaseOCRModel):
 
                 page_texts.append("\n".join(lines))
                 page_texts_raw.append("\n".join(lines_raw))
+                self._maybe_empty_gpu_cache(page_idx)
 
             raw_text     = "\n\n".join(t for t in page_texts     if t)
             raw_text_pre = "\n\n".join(t for t in page_texts_raw if t)
