@@ -21,18 +21,20 @@ async def health(request: Request):
     }
 
 
-@router.get("/gpu", summary="GPU memory status")
+@router.get("/gpu", summary="GPU memory status (Paddle)")
 async def gpu_health():
     try:
-        import torch
-        if torch.cuda.is_available():
-            return {
-                "gpu_available": True,
-                "device_name": torch.cuda.get_device_name(0),
-                "memory_allocated_gb": round(torch.cuda.memory_allocated(0) / 1e9, 2),
-                "memory_reserved_gb": round(torch.cuda.memory_reserved(0) / 1e9, 2),
-                "memory_total_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 2),
-            }
-        return {"gpu_available": False}
-    except ImportError:
-        return {"gpu_available": False, "note": "torch not installed"}
+        import paddle
+
+        is_cuda = getattr(paddle.device, "is_compiled_with_cuda", lambda: False)()
+        if is_cuda:
+            n = paddle.device.cuda.device_count()
+            if n and int(n) > 0:
+                return {
+                    "gpu_available": True,
+                    "backend": "paddle",
+                    "device_count": int(n),
+                }
+    except Exception:
+        pass
+    return {"gpu_available": False, "note": "Paddle CUDA not available or Paddle not installed"}

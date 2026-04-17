@@ -1,7 +1,5 @@
 """
-OCR Model Accuracy Testing Pipeline
-Production-grade FastAPI backend for benchmarking OCR models
-across Arabic, Hindi, Punjabi, and English scripts.
+PaddleOCR pipeline — FastAPI service for document OCR (Arabic, Hindi, Punjabi, English, multilingual).
 """
 
 from fastapi import FastAPI
@@ -23,7 +21,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: warm up model registry. Shutdown: release GPU memory."""
-    logger.info("Initializing OCR Model Registry...")
+    logger.info("Initializing PaddleOCR model registry...")
     registry = ModelRegistry()
     await registry.initialize(settings.ENABLED_MODELS)
     app.state.model_registry = registry
@@ -34,8 +32,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="OCR Accuracy Benchmark API",
-    description="Production pipeline to test and compare OCR model accuracy across Arabic, Hindi, Punjabi, and English.",
+    title="PaddleOCR Pipeline API",
+    description="OCR API backed by PaddleOCR (PP-OCR) with multi-pass Arabic pipeline options.",
     version="1.0.0",
     lifespan=lifespan,
 )
