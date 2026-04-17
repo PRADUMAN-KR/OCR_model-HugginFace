@@ -269,6 +269,19 @@ Common environment variables:
 - `PADDLE_MAX_ACCURACY` — keep the higher-cost multi-pass OCR flow enabled
 - `PADDLE_DEBUG_OUTPUT_DIR` — save debug visualizations
 
+
+# Production-Grade GPU Memory Control
+
+The OCR service is optimized to maintain stable GPU memory usage under high-resolution workloads.
+
+Detection resolution capped via PADDLE_DET_LIMIT_SIDE_LEN
+Optional FP16 inference support
+Controlled TensorRT usage
+Gradual GPU allocator growth strategy
+Cache cleanup between pages
+
+This prevents uncontrolled VRAM spikes and enables safe deployment on shared or production GPU infrastructure.
+
 ## Development
 
 Install test dependencies from `requirements.txt`, then run:
@@ -301,7 +314,8 @@ uvicorn main:app --reload --port 4018
 - async batch processing
 - object storage integration for large OCR workloads
 
-## License
+## Author
 
-Add your preferred license here, for example MIT or Apache-2.0.
-
+Praduman Kumar  
+AI Engineer  
+GitHub: https://github.com/PRADUMAN-KR
